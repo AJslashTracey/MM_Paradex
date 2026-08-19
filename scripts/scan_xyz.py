@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from arb_xyz_bot.scanner import row_to_dict, scan
+from arb_xyz_bot.venues import STOCK_WATCHLIST
 
 
 def usd(value: Decimal | None) -> str:
@@ -23,38 +24,61 @@ def usd(value: Decimal | None) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scan trade[XYZ] markets for reference-market gaps.")
+    parser = argparse.ArgumentParser(description="Scan trade[XYZ] stock markets across comparable venues.")
     parser.add_argument("--top", type=int, default=20, help="number of highest-volume XYZ markets to scan")
+    parser.add_argument(
+        "--stocks",
+        action="store_true",
+        help="scan the built-in stock watchlist: SNDK, NVDA, AAPL, MSFT, TSLA, AMD, MU, TSM, COIN, PLTR, HOOD, CRCL, SPCX, MSTR",
+    )
+    parser.add_argument(
+        "--symbols",
+        help="comma-separated XYZ symbols to scan, for example SNDK,NVDA,AAPL,MSFT",
+    )
     parser.add_argument(
         "--min-edge-bps",
         type=Decimal,
         default=Decimal("0"),
-        help="only print comparisons with an absolute gap at least this many bps",
+        help="only print comparisons with a positive gross edge at least this many bps",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args()
 
-    rows = scan(top=args.top, min_edge_bps=args.min_edge_bps)
+    symbols = None
+    if args.stocks:
+        symbols = set(STOCK_WATCHLIST)
+    if args.symbols:
+        symbols = {symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip()}
+
+    rows = scan(top=args.top, min_edge_bps=args.min_edge_bps, symbols=symbols)
 
     if args.json:
         print(json.dumps([row_to_dict(row) for row in rows], indent=2))
         return
 
-    print(f"{'XYZ':<10} {'Price':>12} {'24h Vol':>12} {'OI est':>12}  References")
-    print("-" * 96)
+    print(f"{'XYZ':<8} {'Price':>12} {'24h Vol':>12} {'OI est':>12}  Venues")
+    print("-" * 120)
     for row in rows:
         market = row.market
-        refs = []
-        for comparison in row.comparisons:
-            refs.append(
-                f"{comparison.reference.venue}:{comparison.reference.symbol} "
-                f"{comparison.edge_bps:+.1f}bps"
-            )
-        ref_text = "; ".join(refs) if refs else "-"
+        checks = []
+        for check in row.checks:
+            edge = f"{check.edge_bps:+.1f}bps" if check.edge_bps is not None else "n/a"
+            if not check.venue_quote.tradable_now:
+                status = "roadmap"
+            elif check.edge_bps is not None and check.edge_bps <= 0:
+                status = "no arb"
+            elif "RFQ" in check.venue_quote.structure:
+                status = "indicative"
+            elif check.executable:
+                status = "live"
+            else:
+                status = "closed"
+            checks.append(f"{check.venue_quote.venue} {edge} {status}")
+        venue_text = "; ".join(checks) if checks else "-"
         price = f"{market.best_price:.6g}" if market.best_price is not None else "-"
         print(
-            f"{market.symbol:<10} {price:>12} "
-            f"{usd(market.day_ntl_vlm):>12} {usd(market.open_interest_usd):>12}  {ref_text}"
+            f"{market.symbol:<8} {price:>12} "
+            f"{usd(market.day_ntl_vlm):>12} {usd(market.open_interest_usd):>12}  {venue_text}"
         )
 
 

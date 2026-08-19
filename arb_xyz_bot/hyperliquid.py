@@ -75,8 +75,9 @@ class HyperliquidClient:
         universe = meta.get("universe", [])
         markets: list[Market] = []
         for asset, ctx in zip(universe, ctxs, strict=False):
-            symbol = str(asset["name"])
-            coin = f"xyz:{symbol}"
+            asset_name = str(asset["name"])
+            symbol = asset_name.split(":", 1)[1] if asset_name.startswith("xyz:") else asset_name
+            coin = asset_name if asset_name.startswith("xyz:") else f"xyz:{symbol}"
             markets.append(
                 Market(
                     symbol=symbol,
@@ -101,4 +102,3 @@ class HyperliquidClient:
             if price is not None:
                 prices[str(asset["name"])] = price
         return prices
-
