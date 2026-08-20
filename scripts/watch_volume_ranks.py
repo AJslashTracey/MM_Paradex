@@ -110,7 +110,7 @@ def main() -> None:
     parser.add_argument(
         "--no-scan-tracked",
         action="store_true",
-        help="only update tracked symbol state; do not write detailed venue scans",
+        help="only update tracked symbol state; do not write detailed reference-market scans",
     )
     args = parser.parse_args()
 

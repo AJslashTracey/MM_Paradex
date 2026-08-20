@@ -4,62 +4,28 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Any
 
+from .binance import BinanceFuturesClient
 from .hyperliquid import HyperliquidClient, Market
-from .venues import STOCK_WATCHLIST, VenueQuote, ostium_quotes, paradex_placeholder, variational_quotes
+from .paradex import ParadexClient
+from .references import ReferenceMarket, references_for_symbol, yahoo_quotes
 
 
 @dataclass(frozen=True)
-class ArbCheck:
-    venue_quote: VenueQuote
-    edge_bps: Decimal | None
+class Comparison:
+    reference: ReferenceMarket
+    reference_price: Decimal
+    edge_bps: Decimal
     direction: str
-    executable: bool
 
 
 @dataclass(frozen=True)
 class ScanRow:
     market: Market
-    checks: list[ArbCheck]
+    comparisons: list[Comparison]
 
 
-def bps(exit_price: Decimal, entry_price: Decimal) -> Decimal:
-    return ((exit_price - entry_price) / entry_price) * Decimal("10000")
-
-
-def quote_mid(market: Market) -> Decimal | None:
-    return market.mid_px or market.mark_px or market.oracle_px
-
-
-def best_cross_venue_edge(xyz: Market, quote: VenueQuote) -> tuple[Decimal | None, str, bool]:
-    xyz_mid = quote_mid(xyz)
-    if xyz_mid is None:
-        return None, "no XYZ price", False
-
-    if quote.bid is not None:
-        long_xyz_edge = bps(quote.bid, xyz_mid)
-    else:
-        long_xyz_edge = None
-
-    if quote.ask is not None:
-        short_xyz_edge = bps(xyz_mid, quote.ask)
-    else:
-        short_xyz_edge = None
-
-    candidates = [
-        (long_xyz_edge, "long XYZ / sell venue"),
-        (short_xyz_edge, "short XYZ / buy venue"),
-    ]
-    candidates = [(edge, direction) for edge, direction in candidates if edge is not None]
-    if not candidates:
-        return None, "listed, no comparable bid/ask", False
-
-    edge, direction = max(candidates, key=lambda item: item[0])
-    executable = edge > 0 and quote.tradable_now and quote.market_open is not False
-    if edge <= 0:
-        direction = f"no gross arb; best leg is {direction}"
-    if "RFQ" in quote.structure:
-        direction = f"{direction} (indicative RFQ)"
-    return edge, direction, executable
+def bps(xyz_price: Decimal, reference_price: Decimal) -> Decimal:
+    return ((xyz_price - reference_price) / reference_price) * Decimal("10000")
 
 
 def scan(
@@ -67,44 +33,86 @@ def scan(
     min_edge_bps: Decimal = Decimal("0"),
     symbols: set[str] | None = None,
 ) -> list[ScanRow]:
-    client = HyperliquidClient()
-    xyz_markets = sorted(client.xyz_markets(), key=lambda m: m.day_ntl_vlm, reverse=True)
+    hyperliquid = HyperliquidClient()
+    xyz_markets = sorted(hyperliquid.xyz_markets(), key=lambda market: market.day_ntl_vlm, reverse=True)
     if symbols:
         wanted = {symbol.upper() for symbol in symbols}
         xyz_markets = [market for market in xyz_markets if market.symbol.upper() in wanted]
 
     selected = xyz_markets[:top]
-    selected_symbols = {market.symbol.upper() for market in selected}
-    venue_quotes = {
-        "variational": variational_quotes(),
-        "ostium": ostium_quotes(),
+    native_prices = hyperliquid.native_perp_prices()
+    native_prices_by_symbol = {
+        symbol.upper(): price for symbol, price in native_prices.items()
     }
+    binance_prices = BinanceFuturesClient().usdt_perp_mid_prices()
+    paradex_prices = ParadexClient().perp_mid_prices()
+    binance_symbols = {
+        base_symbol.upper(): market_symbol
+        for base_symbol, (market_symbol, _) in binance_prices.items()
+    }
+    binance_prices_by_symbol = {
+        market_symbol: mid_price for market_symbol, mid_price in binance_prices.values()
+    }
+    paradex_symbols = {
+        base_symbol.upper(): market_symbol
+        for base_symbol, (market_symbol, _) in paradex_prices.items()
+    }
+    paradex_prices_by_symbol = {
+        market_symbol: mid_price for market_symbol, mid_price in paradex_prices.values()
+    }
+
+    ref_by_symbol: dict[str, list[ReferenceMarket]] = {
+        market.symbol.upper(): references_for_symbol(
+            market.symbol.upper(),
+            set(native_prices_by_symbol),
+            paradex_symbols,
+            binance_symbols,
+        )
+        for market in selected
+    }
+    yahoo_symbols = [
+        ref.symbol
+        for refs in ref_by_symbol.values()
+        for ref in refs
+        if ref.venue == "Yahoo"
+    ]
+    yahoo_prices = yahoo_quotes(yahoo_symbols)
 
     rows: list[ScanRow] = []
     for market in selected:
-        checks: list[ArbCheck] = []
+        xyz_price = market.best_price
+        if xyz_price is None:
+            rows.append(ScanRow(market=market, comparisons=[]))
+            continue
+
         symbol = market.symbol.upper()
+        comparisons: list[Comparison] = []
+        for ref in ref_by_symbol[symbol]:
+            ref_price = None
+            if ref.venue == "Yahoo":
+                ref_price = yahoo_prices.get(ref.symbol)
+            elif ref.venue == "Hyperliquid":
+                ref_price = native_prices_by_symbol.get(ref.symbol.upper())
+            elif ref.venue == "Paradex":
+                ref_price = paradex_prices_by_symbol.get(ref.symbol)
+            elif ref.venue == "Binance":
+                ref_price = binance_prices_by_symbol.get(ref.symbol)
 
-        for venue_name in ("variational", "ostium"):
-            quote = venue_quotes[venue_name].get(symbol)
-            if quote is None:
+            if ref_price is None or ref_price == 0:
                 continue
-            edge, direction, executable = best_cross_venue_edge(market, quote)
-            if edge is not None and edge < min_edge_bps:
-                continue
-            checks.append(ArbCheck(quote, edge, direction, executable))
 
-        if symbol in selected_symbols or symbol in STOCK_WATCHLIST:
-            checks.append(
-                ArbCheck(
-                    paradex_placeholder(symbol),
-                    edge_bps=None,
-                    direction="not tradable yet",
-                    executable=False,
-                )
+            edge = bps(xyz_price, ref_price)
+            if abs(edge) < min_edge_bps:
+                continue
+
+            direction = (
+                "short XYZ / long reference"
+                if edge > 0
+                else "long XYZ / short reference"
             )
+            comparisons.append(Comparison(ref, ref_price, edge, direction))
 
-        rows.append(ScanRow(market=market, checks=checks))
+        rows.append(ScanRow(market=market, comparisons=comparisons))
 
     return rows
 
@@ -114,30 +122,19 @@ def row_to_dict(row: ScanRow) -> dict[str, Any]:
     return {
         "symbol": market.symbol,
         "coin": market.coin,
-        "xyz_price": str(quote_mid(market)) if quote_mid(market) is not None else None,
+        "xyz_price": str(market.best_price) if market.best_price is not None else None,
         "day_volume_usd": str(market.day_ntl_vlm),
         "open_interest_usd": str(market.open_interest_usd)
         if market.open_interest_usd is not None
         else None,
         "funding": str(market.funding) if market.funding is not None else None,
-        "venues": [
+        "comparisons": [
             {
-                **asdict(check.venue_quote),
-                "bid": str(check.venue_quote.bid) if check.venue_quote.bid is not None else None,
-                "ask": str(check.venue_quote.ask) if check.venue_quote.ask is not None else None,
-                "mid": str(check.venue_quote.mid) if check.venue_quote.mid is not None else None,
-                "day_volume_usd": str(check.venue_quote.day_volume_usd)
-                if check.venue_quote.day_volume_usd is not None
-                else None,
-                "open_interest_usd": str(check.venue_quote.open_interest_usd)
-                if check.venue_quote.open_interest_usd is not None
-                else None,
-                "edge_bps": str(check.edge_bps.quantize(Decimal("0.01")))
-                if check.edge_bps is not None
-                else None,
-                "direction": check.direction,
-                "executable": check.executable,
+                **asdict(comparison.reference),
+                "reference_price": str(comparison.reference_price),
+                "edge_bps": str(comparison.edge_bps.quantize(Decimal("0.01"))),
+                "direction": comparison.direction,
             }
-            for check in row.checks
+            for comparison in row.comparisons
         ],
     }

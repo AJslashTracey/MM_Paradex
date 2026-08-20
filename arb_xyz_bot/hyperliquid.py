@@ -15,6 +15,12 @@ class HyperliquidError(RuntimeError):
     pass
 
 
+def normalize_xyz_symbol(symbol: str) -> str:
+    if symbol.startswith("xyz:"):
+        return symbol.split(":", 1)[1]
+    return symbol
+
+
 def decimal_or_none(value: Any) -> Decimal | None:
     if value is None:
         return None
@@ -75,9 +81,8 @@ class HyperliquidClient:
         universe = meta.get("universe", [])
         markets: list[Market] = []
         for asset, ctx in zip(universe, ctxs, strict=False):
-            asset_name = str(asset["name"])
-            symbol = asset_name.split(":", 1)[1] if asset_name.startswith("xyz:") else asset_name
-            coin = asset_name if asset_name.startswith("xyz:") else f"xyz:{symbol}"
+            coin = str(asset["name"])
+            symbol = normalize_xyz_symbol(coin)
             markets.append(
                 Market(
                     symbol=symbol,

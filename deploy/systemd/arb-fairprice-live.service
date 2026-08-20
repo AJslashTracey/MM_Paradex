@@ -1,0 +1,17 @@
+[Unit]
+Description=Arbitrage fair-price live tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aj/deploy-box/arb-fairprice/current
+EnvironmentFile=/home/aj/deploy-box/arb-fairprice/shared/.env
+ExecStart=/usr/bin/python3 /home/aj/deploy-box/arb-fairprice/current/scripts/run_fairprice_tracker.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
