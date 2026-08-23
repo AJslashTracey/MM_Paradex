@@ -27,4 +27,35 @@ Account data
 Open order: Id, side, price, size, remaining size =>  order reconcilliation 
 
 
+## HIP-3 lag/oracle watcher
 
+Run the default RWA lag monitor:
+
+```bash
+python3 scripts/watch_hip3_lag.py
+```
+
+It tracks these default pairs:
+
+- `para:UNITREE` vs `xyz:UNITREE`
+- `io:SNDK` vs `xyz:SNDK`
+- `mkts:US500` vs `xyz:SP500` with `0.1` reference scale
+- `para:AAOI`, `para:AVGO`, `para:CRWD`, `para:IREN`, `para:RDDT`, `para:NET` vs matching `xyz` markets
+
+When a deviation crosses threshold it appends order-book snapshots to
+`data/hip3_lag_order_books.csv`. Each row includes top of book, full bid/ask
+levels from Hyperliquid `l2Book`, book age, mark/oracle/funding context, and
+the trigger metrics.
+
+Useful examples:
+
+```bash
+# Lower the trigger thresholds.
+python3 scripts/watch_hip3_lag.py --edge-bps 10 --mid-deviation-bps 50 --oracle-deviation-bps 50
+
+# Timed capture around a catalyst.
+python3 scripts/watch_hip3_lag.py --duration-s 1800 --output data/unitree_event_books.csv
+
+# Add a custom pair. The last value is an optional scale applied to the reference.
+python3 scripts/watch_hip3_lag.py --pair para:UNITREE=xyz:UNITREE --pair mkts:US500,xyz:SP500,0.1
+```
