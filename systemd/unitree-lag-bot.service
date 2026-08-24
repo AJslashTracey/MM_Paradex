@@ -1,0 +1,15 @@
+[Unit]
+Description=Lag pair basket bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aj/github/Arbitrage_on_xyz
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/aj/github/Arbitrage_on_xyz/execution/unitree_lag_bot.py --live --order-notional 20 --max-order-notional 20 --max-order-size 5.0 --min-order-notional 5 --max-active-positions 1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

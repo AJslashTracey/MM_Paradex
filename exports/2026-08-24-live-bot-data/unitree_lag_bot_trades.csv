@@ -1,0 +1,1 @@
+time_utc,event,mode,side,coin,size,price,order_notional,gross_edge_bps,oracle_gap_bps,pnl_bps,reason,target_bid,target_ask,target_mid,reference_bid,reference_ask,reference_mid,target_oracle,target_spread_bps,target_book_age_ms,reference_book_age_ms,raw_json

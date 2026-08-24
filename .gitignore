@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 venv/
 .env
+execution/*_bot_trades.csv
+execution/*_bot_market_data.csv
+execution/*_bot_fills.csv
