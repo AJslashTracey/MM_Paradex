@@ -1,0 +1,40 @@
+{
+  "binance": {
+    "source_file": "/Users/aj/Desktop/GitHub/MM_Paradex/ena_1m_opens.csv",
+    "output_file": "/Users/aj/Desktop/GitHub/MM_Paradex/trend_line_fits/binance_ena_1m_open_support_fit.csv",
+    "rows": 1440,
+    "quantile": 0.1,
+    "slope": 0.0002637992923524147,
+    "intercept": -2.293179751176099,
+    "lower_offset": -0.016521394612941154,
+    "start": {
+      "open_time_utc": "2026-08-20T14:51:00Z",
+      "open": 0.0993,
+      "support": 0.09929092063580278
+    },
+    "end": {
+      "open_time_utc": "2026-08-21T14:50:00Z",
+      "open": 0.1471,
+      "support": 0.14513456040542463
+    }
+  },
+  "hyperliquid": {
+    "source_file": "/Users/aj/Desktop/GitHub/MM_Paradex/ena_hyperliquid_1m_opens_24h.csv",
+    "output_file": "/Users/aj/Desktop/GitHub/MM_Paradex/trend_line_fits/hyperliquid_ena_1m_open_support_fit.csv",
+    "rows": 1440,
+    "quantile": 0.1,
+    "slope": 0.00026424426899953924,
+    "intercept": -2.2919408984114007,
+    "lower_offset": -0.01675070873274198,
+    "start": {
+      "open_time_utc": "2026-08-20T14:52:00Z",
+      "open": 0.099511,
+      "support": 0.0993912092713811
+    },
+    "end": {
+      "open_time_utc": "2026-08-21T14:51:00Z",
+      "open": 0.14788,
+      "support": 0.1453742097566593
+    }
+  }
+}
