@@ -16,7 +16,7 @@ import signal
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -105,6 +105,57 @@ class PairRuntimeState:
     simulated_position: BotPosition | None = None
     live_tracked_position: BotPosition | None = None
     last_trade_ms: int = 0
+
+
+@dataclass(frozen=True)
+class ProfilePreset:
+    pair_targets: tuple[str, ...]
+    entry_edge_bps_override: float
+    require_oracle_confirmation: bool
+    order_notional: float
+    max_order_notional: float
+    max_order_size: float | None
+    min_order_notional: float
+    max_active_positions: int
+    cooldown_ms: int
+    max_hold_s: float
+    take_profit_bps: float
+    stop_loss_bps: float
+    exit_edge_bps: float
+
+
+PROFILE_PRESETS: dict[str, ProfilePreset] = {
+    "sndk-conservative": ProfilePreset(
+        pair_targets=("io:SNDK",),
+        entry_edge_bps_override=3.0,
+        require_oracle_confirmation=False,
+        order_notional=100.0,
+        max_order_notional=100.0,
+        max_order_size=0.1,
+        min_order_notional=50.0,
+        max_active_positions=1,
+        cooldown_ms=1000,
+        max_hold_s=10.0,
+        take_profit_bps=2.0,
+        stop_loss_bps=8.0,
+        exit_edge_bps=0.5,
+    ),
+    "sndk-aggressive": ProfilePreset(
+        pair_targets=("io:SNDK",),
+        entry_edge_bps_override=1.0,
+        require_oracle_confirmation=False,
+        order_notional=250.0,
+        max_order_notional=250.0,
+        max_order_size=0.2,
+        min_order_notional=50.0,
+        max_active_positions=1,
+        cooldown_ms=1000,
+        max_hold_s=10.0,
+        take_profit_bps=2.0,
+        stop_loss_bps=8.0,
+        exit_edge_bps=0.5,
+    ),
+}
 
 
 FIELDS = [
@@ -639,6 +690,30 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-order-size must be positive when provided")
     if args.max_active_positions <= 0:
         raise ValueError("--max-active-positions must be positive")
+    if args.entry_edge_bps_override is not None and args.entry_edge_bps_override < 0:
+        raise ValueError("--entry-edge-bps-override cannot be negative")
+    if args.target_filled_volume_usd is not None and args.target_filled_volume_usd <= 0:
+        raise ValueError("--target-filled-volume-usd must be positive")
+
+
+def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
+    if args.profile is None:
+        return args
+    preset = PROFILE_PRESETS[args.profile]
+    args.pair_target = list(preset.pair_targets)
+    args.entry_edge_bps_override = preset.entry_edge_bps_override
+    args.require_oracle_confirmation = preset.require_oracle_confirmation
+    args.order_notional = preset.order_notional
+    args.max_order_notional = preset.max_order_notional
+    args.max_order_size = preset.max_order_size
+    args.min_order_notional = preset.min_order_notional
+    args.max_active_positions = preset.max_active_positions
+    args.cooldown_ms = preset.cooldown_ms
+    args.max_hold_s = preset.max_hold_s
+    args.take_profit_bps = preset.take_profit_bps
+    args.stop_loss_bps = preset.stop_loss_bps
+    args.exit_edge_bps = preset.exit_edge_bps
+    return args
 
 
 def entry_order_is_allowed(size: float, limit_px: float, args: argparse.Namespace) -> str | None:
@@ -652,14 +727,29 @@ def entry_order_is_allowed(size: float, limit_px: float, args: argparse.Namespac
     return None
 
 
-def unique_coins() -> list[str]:
-    coins = {pair.target_coin for pair in PAIR_CONFIGS}
-    coins.update(pair.reference_coin for pair in PAIR_CONFIGS)
+def resolve_pair_configs(args: argparse.Namespace) -> tuple[PairConfig, ...]:
+    pair_configs = PAIR_CONFIGS
+    if args.pair_target:
+        requested = set(args.pair_target)
+        pair_configs = tuple(pair for pair in pair_configs if pair.target_coin in requested)
+        missing = requested.difference({pair.target_coin for pair in pair_configs})
+        if missing:
+            raise ValueError(f"Unknown --pair-target values: {', '.join(sorted(missing))}")
+    if args.entry_edge_bps_override is not None:
+        pair_configs = tuple(replace(pair, entry_edge_bps=args.entry_edge_bps_override) for pair in pair_configs)
+    if not pair_configs:
+        raise ValueError("No active pairs configured after applying filters")
+    return pair_configs
+
+
+def unique_coins(pair_configs: tuple[PairConfig, ...]) -> list[str]:
+    coins = {pair.target_coin for pair in pair_configs}
+    coins.update(pair.reference_coin for pair in pair_configs)
     return sorted(coins)
 
 
-async def subscribe(ws: websockets.WebSocketClientProtocol) -> None:
-    for coin in unique_coins():
+async def subscribe(ws: websockets.WebSocketClientProtocol, pair_configs: tuple[PairConfig, ...]) -> None:
+    for coin in unique_coins(pair_configs):
         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}))
         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "activeAssetCtx", "coin": coin}}))
 
@@ -670,9 +760,9 @@ async def heartbeat(ws: websockets.WebSocketClientProtocol, interval_s: float) -
         await ws.send(json.dumps({"method": "ping"}))
 
 
-def build_runtime_states(args: argparse.Namespace) -> dict[str, PairRuntimeState]:
+def build_runtime_states(pair_configs: tuple[PairConfig, ...], args: argparse.Namespace) -> dict[str, PairRuntimeState]:
     runtimes: dict[str, PairRuntimeState] = {}
-    for pair in PAIR_CONFIGS:
+    for pair in pair_configs:
         runtimes[pair.target_coin] = PairRuntimeState(
             pair=pair,
             size_decimals=load_size_decimals(pair.target_coin, args.http_timeout),
@@ -696,27 +786,29 @@ def live_position_from_positions(pair: PairConfig, observed_positions: dict[str,
     )
 
 
-def pair_watchlist_summary() -> str:
-    return ", ".join(f"{pair.pair_id}@{pair.entry_edge_bps:.0f}bps" for pair in PAIR_CONFIGS)
+def pair_watchlist_summary(pair_configs: tuple[PairConfig, ...]) -> str:
+    return ", ".join(f"{pair.pair_id}@{pair.entry_edge_bps:.2f}bps" for pair in pair_configs)
 
 
 async def run_bot(args: argparse.Namespace) -> int:
     live = bool(args.live)
     dry_run = not live
-    pair_by_target_coin = {pair.target_coin: pair for pair in PAIR_CONFIGS}
-    runtimes = build_runtime_states(args)
+    pair_configs = resolve_pair_configs(args)
+    pair_by_target_coin = {pair.target_coin: pair for pair in pair_configs}
+    runtimes = build_runtime_states(pair_configs, args)
     executor = None if dry_run else HyperliquidExecutor(testnet=args.testnet)
     logger = TradeLogger(args.log, dry_run=dry_run)
     market_logger = MarketDataLogger(args.market_log, dry_run=dry_run)
     fill_logger = FillLogger(args.fill_log, dry_run=dry_run, pair_by_target_coin=pair_by_target_coin)
 
-    states = {coin: BookState(coin) for coin in unique_coins()}
+    states = {coin: BookState(coin) for coin in unique_coins(pair_configs)}
     last_deadman_ms = 0
     last_market_log_ms = 0
     last_fill_poll_ms = 0
     seen_fill_keys: set[str] = set()
+    cumulative_filled_volume_usd = 0.0
     stop = asyncio.Event()
-    target_coin_set = pair_targets()
+    target_coin_set = {pair.target_coin for pair in pair_configs}
 
     def request_stop() -> None:
         stop.set()
@@ -732,11 +824,12 @@ async def run_bot(args: argparse.Namespace) -> int:
         loop.call_later(args.duration_s, request_stop)
 
     print(
-        f"mode={'live' if live else 'dry-run'} pairs={len(PAIR_CONFIGS)} "
-        f"order_notional={args.order_notional} max_active_positions={args.max_active_positions}",
+        f"mode={'live' if live else 'dry-run'} pairs={len(pair_configs)} "
+        f"order_notional={args.order_notional} max_active_positions={args.max_active_positions} "
+        f"target_filled_volume_usd={args.target_filled_volume_usd}",
         flush=True,
     )
-    print(f"watchlist={pair_watchlist_summary()}", flush=True)
+    print(f"watchlist={pair_watchlist_summary(pair_configs)}", flush=True)
     if live:
         print("LIVE MODE: orders will be sent through execution/executor.py", flush=True)
 
@@ -744,7 +837,7 @@ async def run_bot(args: argparse.Namespace) -> int:
         while not stop.is_set():
             try:
                 async with websockets.connect(args.ws_url, ping_interval=None, close_timeout=5) as ws:
-                    await subscribe(ws)
+                    await subscribe(ws, pair_configs)
                     ping_task = asyncio.create_task(heartbeat(ws, args.ping_interval_s))
                     print(f"[{utc_iso()}] connected", flush=True)
                     try:
@@ -844,8 +937,24 @@ async def run_bot(args: argparse.Namespace) -> int:
                                     if fill_key in seen_fill_keys:
                                         continue
                                     fill_logger.write(fill)
+                                    fill_sz = to_float(fill.get("sz")) or 0.0
+                                    fill_px = to_float(fill.get("px")) or 0.0
+                                    cumulative_filled_volume_usd += abs(fill_sz) * fill_px
                                     seen_fill_keys.add(fill_key)
+                                    if (
+                                        args.target_filled_volume_usd is not None
+                                        and cumulative_filled_volume_usd >= args.target_filled_volume_usd
+                                    ):
+                                        print(
+                                            f"[{utc_iso()}] target filled volume reached: "
+                                            f"{cumulative_filled_volume_usd:.2f} >= {args.target_filled_volume_usd:.2f}; stopping",
+                                            flush=True,
+                                        )
+                                        stop.set()
+                                        break
                                 last_fill_poll_ms = now_ms()
+                                if stop.is_set():
+                                    continue
 
                             active_position_count = sum(
                                 1 for position in active_positions.values() if position is not None
@@ -1054,7 +1163,7 @@ async def run_bot(args: argparse.Namespace) -> int:
             except asyncio.TimeoutError:
                 print(f"[{utc_iso()}] websocket timeout; reconnecting", flush=True)
             except Exception as exc:
-                for pair in PAIR_CONFIGS:
+                for pair in pair_configs:
                     logger.write(
                         event="error",
                         reason=str(exc),
@@ -1067,7 +1176,7 @@ async def run_bot(args: argparse.Namespace) -> int:
                 await asyncio.sleep(args.reconnect_delay_s)
     finally:
         if live and executor is not None:
-            for pair in PAIR_CONFIGS:
+            for pair in pair_configs:
                 try:
                     executor.cancel_all_for_coin(pair.target_coin)
                 except Exception as exc:
@@ -1106,6 +1215,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-order-size", type=float, default=None, help="Optional hard cap on base-asset units per order")
     parser.add_argument("--min-order-notional", type=float, default=5.0, help="Skip if rounded order falls below this")
     parser.add_argument("--max-active-positions", type=int, default=1, help="Global cap on simultaneously open target positions")
+    parser.add_argument("--profile", choices=sorted(PROFILE_PRESETS), default=None, help="Apply a named SNDK farming profile")
+    parser.add_argument("--pair-target", action="append", help="Limit the bot to one or more target coins, e.g. io:SNDK")
+    parser.add_argument("--entry-edge-bps-override", type=float, default=None, help="Override per-pair entry edge threshold for all active pairs")
+    parser.add_argument("--target-filled-volume-usd", type=float, default=None, help="Stop once cumulative filled notional reaches this amount")
     parser.add_argument("--entry-oracle-gap-bps", type=float, default=75.0, help="Required oracle confirmation size")
     parser.add_argument(
         "--no-oracle-confirmation",
@@ -1115,7 +1228,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--exit-edge-bps", type=float, default=5.0, help="Exit if same-direction edge compresses below this")
     parser.add_argument("--min-top-notional", type=float, default=80.0, help="Minimum executable top-book notional on both legs")
-    parser.add_argument("--max-book-age-ms", type=int, default=750, help="Max age for target/reference books")
+    parser.add_argument("--max-book-age-ms", type=int, default=2500, help="Max age for target/reference books")
     parser.add_argument("--max-target-spread-bps", type=float, default=25.0, help="Max target top-of-book spread")
     parser.add_argument("--take-profit-bps", type=float, default=50.0, help="Reduce-only exit profit target")
     parser.add_argument("--stop-loss-bps", type=float, default=75.0, help="Reduce-only exit stop loss")
@@ -1140,7 +1253,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    args = apply_profile(parse_args())
     validate_args(args)
     return asyncio.run(run_bot(args))
 

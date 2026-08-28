@@ -1,5 +1,5 @@
 [Unit]
-Description=Lag pair basket bot
+Description=Lag pair bot
 After=network-online.target
 Wants=network-online.target
 
