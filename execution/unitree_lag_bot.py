@@ -192,6 +192,7 @@ MARKET_FIELDS = [
     "time_utc",
     "mode",
     "event",
+    "connection_seq",
     "pair",
     "target_coin",
     "reference_coin",
@@ -207,6 +208,7 @@ MARKET_FIELDS = [
     "target_ask_sz",
     "target_book_time_ms",
     "target_recv_time_ms",
+    "target_recv_lag_ms",
     "target_oracle",
     "target_mark",
     "reference_bid",
@@ -216,13 +218,21 @@ MARKET_FIELDS = [
     "reference_ask_sz",
     "reference_book_time_ms",
     "reference_recv_time_ms",
+    "reference_recv_lag_ms",
+    "cross_recv_skew_ms",
     "reference_oracle",
     "reference_mark",
+    "long_edge_bps",
+    "short_edge_bps",
+    "best_edge_bps",
     "gross_edge_bps",
     "oracle_gap_bps",
     "target_spread_bps",
     "target_book_age_ms",
     "reference_book_age_ms",
+    "target_book_is_fresh",
+    "reference_book_is_fresh",
+    "pair_is_synchronized",
 ]
 
 FILL_FIELDS = [
@@ -286,6 +296,30 @@ def mid(state: BookState) -> float | None:
         return (bid + ask) / 2
     ctx = state.ctx or {}
     return to_float(ctx.get("midPx")) or to_float(ctx.get("markPx"))
+
+
+def book_age_ms(state: BookState, received_ms: int | None = None) -> int | None:
+    if state.book_time_ms is None:
+        return None
+    as_of_ms = now_ms() if received_ms is None else received_ms
+    return max(0, as_of_ms - state.book_time_ms)
+
+
+def recv_lag_ms(state: BookState) -> int | None:
+    if state.book_time_ms is None or state.recv_time_ms is None:
+        return None
+    return max(0, state.recv_time_ms - state.book_time_ms)
+
+
+def is_book_fresh(state: BookState, max_age_ms: int, received_ms: int | None = None) -> bool:
+    age_ms = book_age_ms(state, received_ms)
+    return age_ms is not None and age_ms <= max_age_ms
+
+
+def cross_recv_skew_ms(left: BookState, right: BookState) -> int | None:
+    if left.recv_time_ms is None or right.recv_time_ms is None:
+        return None
+    return abs(left.recv_time_ms - right.recv_time_ms)
 
 
 def bps(diff: float | None, denom: float | None) -> float | None:
@@ -461,17 +495,60 @@ class MarketDataLogger:
         signal: Signal | None,
         states: dict[str, BookState],
         position: BotPosition | None,
+        max_book_age_ms: int,
+        max_cross_recv_skew_ms: int,
+        connection_seq: int,
     ) -> None:
         target, reference = pair_states(states, pair)
         target_bid = best_bid(target) or {}
         target_ask = best_ask(target) or {}
         reference_bid = best_bid(reference) or {}
         reference_ask = best_ask(reference) or {}
+        if not all([target_bid, target_ask, reference_bid, reference_ask]):
+            return
+        snapshot_ms = now_ms()
+        target_mid = mid(target)
+        reference_mid = scaled_reference_value(mid(reference), pair)
+        target_age_ms = book_age_ms(target, snapshot_ms)
+        reference_age_ms = book_age_ms(reference, snapshot_ms)
+        target_fresh = is_book_fresh(target, max_book_age_ms, snapshot_ms)
+        reference_fresh = is_book_fresh(reference, max_book_age_ms, snapshot_ms)
+        recv_skew = cross_recv_skew_ms(target, reference)
+        pair_is_synchronized = recv_skew is not None and recv_skew <= max_cross_recv_skew_ms
+        row_event = event
+        if event == "snapshot" and not (target_fresh and reference_fresh):
+            row_event = "snapshot_stale"
+        elif event == "snapshot" and not pair_is_synchronized:
+            row_event = "snapshot_desynced"
+        target_spread_bps = ""
+        long_edge_bps = ""
+        short_edge_bps = ""
+        best_edge_bps = ""
+        if target_mid is not None:
+            target_bid_px = to_float(target_bid.get("px"))
+            target_ask_px = to_float(target_ask.get("px"))
+            if target_bid_px is not None and target_ask_px is not None and target_mid > 0:
+                target_spread_bps = f"{(target_ask_px - target_bid_px) / target_mid * 10_000:.6f}"
+                reference_bid_px = scaled_reference_value(to_float(reference_bid.get("px")), pair)
+                reference_ask_px = scaled_reference_value(to_float(reference_ask.get("px")), pair)
+                if reference_mid is not None and reference_mid > 0 and reference_bid_px is not None and reference_ask_px is not None:
+                    long_edge = (reference_bid_px - target_ask_px) / reference_mid * 10_000
+                    short_edge = (target_bid_px - reference_ask_px) / reference_mid * 10_000
+                    long_edge_bps = f"{long_edge:.6f}"
+                    short_edge_bps = f"{short_edge:.6f}"
+                    best_edge_bps = f"{max(long_edge, short_edge):.6f}"
+        oracle_gap_bps = ""
+        target_oracle = to_float((target.ctx or {}).get("oraclePx"))
+        if target_oracle is not None and reference_mid is not None and reference_mid > 0:
+            oracle_gap = bps(target_oracle - reference_mid, reference_mid)
+            if oracle_gap is not None:
+                oracle_gap_bps = f"{oracle_gap:.6f}"
         self.writer.writerow(
             {
-                "time_utc": utc_iso(),
+                "time_utc": utc_iso(snapshot_ms),
                 "mode": "dry_run" if self.dry_run else "live",
-                "event": event,
+                "event": row_event,
+                "connection_seq": connection_seq,
                 "pair": pair.pair_id,
                 "target_coin": pair.target_coin,
                 "reference_coin": pair.reference_coin,
@@ -482,27 +559,36 @@ class MarketDataLogger:
                 "position_entry_px": "" if position is None else f"{position.entry_px:.10f}",
                 "target_bid": px(target_bid),
                 "target_ask": px(target_ask),
-                "target_mid": fmt(mid(target)),
+                "target_mid": fmt(target_mid),
                 "target_bid_sz": target_bid.get("sz", ""),
                 "target_ask_sz": target_ask.get("sz", ""),
                 "target_book_time_ms": target.book_time_ms or "",
                 "target_recv_time_ms": target.recv_time_ms or "",
+                "target_recv_lag_ms": "" if recv_lag_ms(target) is None else recv_lag_ms(target),
                 "target_oracle": (target.ctx or {}).get("oraclePx", ""),
                 "target_mark": (target.ctx or {}).get("markPx", ""),
                 "reference_bid": scaled_level_px(reference_bid, pair),
                 "reference_ask": scaled_level_px(reference_ask, pair),
-                "reference_mid": fmt(scaled_reference_value(mid(reference), pair)),
+                "reference_mid": fmt(reference_mid),
                 "reference_bid_sz": reference_bid.get("sz", ""),
                 "reference_ask_sz": reference_ask.get("sz", ""),
                 "reference_book_time_ms": reference.book_time_ms or "",
                 "reference_recv_time_ms": reference.recv_time_ms or "",
+                "reference_recv_lag_ms": "" if recv_lag_ms(reference) is None else recv_lag_ms(reference),
+                "cross_recv_skew_ms": "" if recv_skew is None else recv_skew,
                 "reference_oracle": (reference.ctx or {}).get("oraclePx", ""),
                 "reference_mark": (reference.ctx or {}).get("markPx", ""),
+                "long_edge_bps": long_edge_bps,
+                "short_edge_bps": short_edge_bps,
+                "best_edge_bps": best_edge_bps,
                 "gross_edge_bps": "" if signal is None else f"{signal.gross_edge_bps:.6f}",
-                "oracle_gap_bps": "" if signal is None or signal.oracle_gap_bps is None else f"{signal.oracle_gap_bps:.6f}",
-                "target_spread_bps": "" if signal is None else f"{signal.target_spread_bps:.6f}",
-                "target_book_age_ms": "" if signal is None else signal.target_book_age_ms,
-                "reference_book_age_ms": "" if signal is None else signal.reference_book_age_ms,
+                "oracle_gap_bps": oracle_gap_bps,
+                "target_spread_bps": target_spread_bps,
+                "target_book_age_ms": "" if target_age_ms is None else target_age_ms,
+                "reference_book_age_ms": "" if reference_age_ms is None else reference_age_ms,
+                "target_book_is_fresh": str(target_fresh).lower(),
+                "reference_book_is_fresh": str(reference_fresh).lower(),
+                "pair_is_synchronized": str(pair_is_synchronized).lower(),
             }
         )
         self.file.flush()
@@ -574,8 +660,10 @@ def compute_signal(pair: PairConfig, states: dict[str, BookState], args: argpars
     target_ask_px = float(target_ask["px"])
     reference_bid_px = float(reference_bid["px"]) * pair.reference_scale
     reference_ask_px = float(reference_ask["px"]) * pair.reference_scale
-    target_book_age_ms = received_ms - target.book_time_ms
-    reference_book_age_ms = received_ms - reference.book_time_ms
+    target_book_age_ms = book_age_ms(target, received_ms)
+    reference_book_age_ms = book_age_ms(reference, received_ms)
+    if target_book_age_ms is None or reference_book_age_ms is None:
+        return None
     target_spread_bps = (target_ask_px - target_bid_px) / target_mid * 10_000
     target_oracle = to_float((target.ctx or {}).get("oraclePx"))
     oracle_gap = bps(target_oracle - reference_mid if target_oracle is not None else None, reference_mid)
@@ -676,6 +764,8 @@ def order_size(entry_px: float, size_decimals: int, args: argparse.Namespace) ->
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.live and args.collect_only:
+        raise ValueError("--collect-only cannot be combined with --live")
     if args.order_notional <= 0:
         raise ValueError("--order-notional must be positive")
     if args.max_order_notional <= 0:
@@ -692,6 +782,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-active-positions must be positive")
     if args.entry_edge_bps_override is not None and args.entry_edge_bps_override < 0:
         raise ValueError("--entry-edge-bps-override cannot be negative")
+    if args.max_cross_recv_skew_ms <= 0:
+        raise ValueError("--max-cross-recv-skew-ms must be positive")
     if args.target_filled_volume_usd is not None and args.target_filled_volume_usd <= 0:
         raise ValueError("--target-filled-volume-usd must be positive")
 
@@ -760,12 +852,16 @@ async def heartbeat(ws: websockets.WebSocketClientProtocol, interval_s: float) -
         await ws.send(json.dumps({"method": "ping"}))
 
 
-def build_runtime_states(pair_configs: tuple[PairConfig, ...], args: argparse.Namespace) -> dict[str, PairRuntimeState]:
+def build_runtime_states(
+    pair_configs: tuple[PairConfig, ...],
+    args: argparse.Namespace,
+    collect_only: bool = False,
+) -> dict[str, PairRuntimeState]:
     runtimes: dict[str, PairRuntimeState] = {}
     for pair in pair_configs:
         runtimes[pair.target_coin] = PairRuntimeState(
             pair=pair,
-            size_decimals=load_size_decimals(pair.target_coin, args.http_timeout),
+            size_decimals=0 if collect_only else load_size_decimals(pair.target_coin, args.http_timeout),
         )
     return runtimes
 
@@ -786,6 +882,16 @@ def live_position_from_positions(pair: PairConfig, observed_positions: dict[str,
     )
 
 
+def reset_states(states: dict[str, BookState]) -> None:
+    for state in states.values():
+        state.book_time_ms = None
+        state.recv_time_ms = None
+        state.bids = None
+        state.asks = None
+        state.ctx = None
+        state.ctx_recv_time_ms = None
+
+
 def pair_watchlist_summary(pair_configs: tuple[PairConfig, ...]) -> str:
     return ", ".join(f"{pair.pair_id}@{pair.entry_edge_bps:.2f}bps" for pair in pair_configs)
 
@@ -793,9 +899,10 @@ def pair_watchlist_summary(pair_configs: tuple[PairConfig, ...]) -> str:
 async def run_bot(args: argparse.Namespace) -> int:
     live = bool(args.live)
     dry_run = not live
+    collect_only = bool(args.collect_only)
     pair_configs = resolve_pair_configs(args)
     pair_by_target_coin = {pair.target_coin: pair for pair in pair_configs}
-    runtimes = build_runtime_states(pair_configs, args)
+    runtimes = build_runtime_states(pair_configs, args, collect_only=collect_only)
     executor = None if dry_run else HyperliquidExecutor(testnet=args.testnet)
     logger = TradeLogger(args.log, dry_run=dry_run)
     market_logger = MarketDataLogger(args.market_log, dry_run=dry_run)
@@ -809,6 +916,7 @@ async def run_bot(args: argparse.Namespace) -> int:
     cumulative_filled_volume_usd = 0.0
     stop = asyncio.Event()
     target_coin_set = {pair.target_coin for pair in pair_configs}
+    connection_seq = 0
 
     def request_stop() -> None:
         stop.set()
@@ -824,7 +932,7 @@ async def run_bot(args: argparse.Namespace) -> int:
         loop.call_later(args.duration_s, request_stop)
 
     print(
-        f"mode={'live' if live else 'dry-run'} pairs={len(pair_configs)} "
+        f"mode={'collect-only' if collect_only else ('live' if live else 'dry-run')} pairs={len(pair_configs)} "
         f"order_notional={args.order_notional} max_active_positions={args.max_active_positions} "
         f"target_filled_volume_usd={args.target_filled_volume_usd}",
         flush=True,
@@ -836,10 +944,12 @@ async def run_bot(args: argparse.Namespace) -> int:
     try:
         while not stop.is_set():
             try:
+                reset_states(states)
+                connection_seq += 1
                 async with websockets.connect(args.ws_url, ping_interval=None, close_timeout=5) as ws:
                     await subscribe(ws, pair_configs)
                     ping_task = asyncio.create_task(heartbeat(ws, args.ping_interval_s))
-                    print(f"[{utc_iso()}] connected", flush=True)
+                    print(f"[{utc_iso()}] connected connection_seq={connection_seq}", flush=True)
                     try:
                         while not stop.is_set():
                             raw = await asyncio.wait_for(ws.recv(), timeout=args.recv_timeout_s)
@@ -872,11 +982,14 @@ async def run_bot(args: argparse.Namespace) -> int:
                                 last_deadman_ms = now_ms()
 
                             observed_positions: dict[str, Any] = {}
-                            if live and executor is not None:
+                            if live and executor is not None and not collect_only:
                                 observed_positions = executor.get_positions()
 
                             active_positions: dict[str, BotPosition | None] = {}
                             for runtime in runtimes.values():
+                                if collect_only:
+                                    active_positions[runtime.pair.target_coin] = None
+                                    continue
                                 if dry_run:
                                     active_positions[runtime.pair.target_coin] = runtime.simulated_position
                                     continue
@@ -912,8 +1025,14 @@ async def run_bot(args: argparse.Namespace) -> int:
                                         signal=current_signals[runtime.pair.target_coin],
                                         states=states,
                                         position=active_positions[runtime.pair.target_coin],
+                                        max_book_age_ms=args.max_book_age_ms,
+                                        max_cross_recv_skew_ms=args.max_cross_recv_skew_ms,
+                                        connection_seq=connection_seq,
                                     )
                                 last_market_log_ms = now_ms()
+
+                            if collect_only:
+                                continue
 
                             if (
                                 live
@@ -1008,9 +1127,12 @@ async def run_bot(args: argparse.Namespace) -> int:
                                         market_logger.write(
                                             event="exit_order",
                                             pair=pair,
-                                            signal=current_signal,
+                                        signal=current_signal,
                                             states=states,
                                             position=active_position,
+                                            max_book_age_ms=args.max_book_age_ms,
+                                            max_cross_recv_skew_ms=args.max_cross_recv_skew_ms,
+                                            connection_seq=connection_seq,
                                         )
                                         print(
                                             f"[{utc_iso()}] exit {pair.pair_id} {active_position.side} "
@@ -1147,6 +1269,9 @@ async def run_bot(args: argparse.Namespace) -> int:
                                     signal=current_signal,
                                     states=states,
                                     position=active_positions[pair.target_coin],
+                                    max_book_age_ms=args.max_book_age_ms,
+                                    max_cross_recv_skew_ms=args.max_cross_recv_skew_ms,
+                                    connection_seq=connection_seq,
                                 )
                                 print(
                                     f"[{utc_iso()}] entry {pair.pair_id} {current_signal.side} {size} @ {limit_px} "
@@ -1195,6 +1320,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Execute tiny unhedged lag test orders for a small target/reference pair basket."
     )
+    parser.add_argument("--collect-only", action="store_true", help="Record market snapshots only; do not simulate or send trades.")
     parser.add_argument("--live", action="store_true", help="Send real orders. Default is dry-run.")
     parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet executor base URL")
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG, help=f"CSV event log path, default: {DEFAULT_LOG}")
@@ -1228,7 +1354,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--exit-edge-bps", type=float, default=5.0, help="Exit if same-direction edge compresses below this")
     parser.add_argument("--min-top-notional", type=float, default=80.0, help="Minimum executable top-book notional on both legs")
-    parser.add_argument("--max-book-age-ms", type=int, default=2500, help="Max age for target/reference books")
+    parser.add_argument("--max-book-age-ms", type=int, default=750, help="Max age for target/reference books")
+    parser.add_argument("--max-cross-recv-skew-ms", type=int, default=250, help="Max allowed cross-venue receive-time skew for pair synchronization labels")
     parser.add_argument("--max-target-spread-bps", type=float, default=25.0, help="Max target top-of-book spread")
     parser.add_argument("--take-profit-bps", type=float, default=50.0, help="Reduce-only exit profit target")
     parser.add_argument("--stop-loss-bps", type=float, default=75.0, help="Reduce-only exit stop loss")

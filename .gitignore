@@ -1,8 +1,10 @@
+.DS_Store
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .env
+exports/
 execution/*_bot_trades.csv
 execution/*_bot_market_data.csv
 execution/*_bot_fills.csv
