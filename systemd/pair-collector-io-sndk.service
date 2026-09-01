@@ -1,0 +1,18 @@
+[Unit]
+Description=Pair collector for io:SNDK vs xyz:SNDK
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aj/github/Arbitrage_on_xyz
+Environment=PYTHONUNBUFFERED=1
+Environment=PAIR_MARKET_LOG_INTERVAL_MS=500
+Environment=PAIR_MAX_BOOK_AGE_MS=1500
+Environment=PAIR_MAX_CROSS_RECV_SKEW_MS=250
+ExecStart=/home/aj/github/Arbitrage_on_xyz/scripts/run_pair_market_collector.sh io:SNDK /home/aj/github/Arbitrage_on_xyz/exports/pair_collectors/systemd/io_SNDK__xyz_SNDK
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
