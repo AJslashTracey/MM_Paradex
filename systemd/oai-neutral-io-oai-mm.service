@@ -1,0 +1,24 @@
+[Unit]
+Description=Neutral io:OAI market-maker against Binance OPENAIUSDT
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aj/github/Arbitrage_on_xyz
+Environment=PYTHONUNBUFFERED=1
+Environment=OAI_MM_LIVE=0
+Environment=OAI_MM_STRATEGY_MODE=binance_basis
+Environment=OAI_MM_ORDER_SIZE=0.01
+Environment=OAI_MM_MAX_ORDER_SIZE=0.01
+Environment=OAI_MM_MAX_OPEN_NOTIONAL=50
+Environment=OAI_MM_SOFT_INVENTORY_LIMIT=0.02
+Environment=OAI_MM_HARD_INVENTORY_LIMIT=0.04
+Environment=OAI_MM_MAX_DATA_AGE_MS=1500
+Environment=OAI_MM_MAX_CROSS_RECV_SKEW_MS=500
+ExecStart=/home/aj/github/Arbitrage_on_xyz/scripts/run_oai_neutral_mm.sh /home/aj/github/Arbitrage_on_xyz/exports/oai_mm/systemd/io_OAI__binance_OPENAIUSDT
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

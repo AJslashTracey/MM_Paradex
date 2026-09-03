@@ -6,9 +6,13 @@ This module intentionally does nothing at import time. Instantiate
 
 from __future__ import annotations
 
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from json import JSONDecodeError
 from typing import Any, Literal
 
 from dotenv import load_dotenv
@@ -52,14 +56,17 @@ class HyperliquidExecutor:
             raise ValueError(f"Missing {private_key_env} or {address_env} in environment/.env")
 
         try:
+            from hyperliquid.api import API
             from hyperliquid.exchange import Exchange
             from hyperliquid.utils import constants
+            from hyperliquid.utils.error import ClientError, ServerError
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
                 "Official hyperliquid-python-sdk is not importable. Install the SDK in this Python env "
                 "or run this executor on the server environment where it is installed."
             ) from exc
 
+        _install_hyperliquid_post_fallback(API, ClientError, ServerError)
         base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self.wallet = Account.from_key(self.private_key)
         self.exchange = Exchange(
@@ -219,3 +226,42 @@ def _float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _install_hyperliquid_post_fallback(api_cls: type, client_error_cls: type[Exception], server_error_cls: type[Exception]) -> None:
+    if getattr(api_cls, "_codex_urllib_fallback_installed", False):
+        return
+
+    def post_via_urllib(self: Any, url_path: str, payload: Any = None) -> Any:
+        payload = payload or {}
+        url = self.base_url + url_path
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                text = response.read().decode("utf-8")
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return {"error": f"Could not parse JSON: {text}"}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if 400 <= exc.code < 500:
+                try:
+                    err = json.loads(body)
+                except JSONDecodeError as parse_exc:
+                    raise client_error_cls(exc.code, None, body, None, exc.headers) from parse_exc
+                if err is None:
+                    raise client_error_cls(exc.code, None, body, None, exc.headers)
+                error_data = err.get("data")
+                raise client_error_cls(exc.code, err.get("code"), err.get("msg", body), exc.headers, error_data)
+            raise server_error_cls(exc.code, body)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Hyperliquid API request failed: {exc.reason}") from exc
+
+    api_cls.post = post_via_urllib
+    api_cls._codex_urllib_fallback_installed = True
