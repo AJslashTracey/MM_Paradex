@@ -8,8 +8,8 @@ from execution.oai_mm.config import MMConfig
 from execution.oai_mm.fair_value_model import FairValueModel
 from execution.oai_mm.hyperliquid_feed import apply_hyperliquid_message
 from execution.oai_mm.inventory_manager import InventoryManager
-from execution.oai_mm.models import Level, VenueBook, VenueState
-from execution.oai_mm.order_manager import parse_order_result
+from execution.oai_mm.models import ActiveOrder, Level, QuoteIntent, VenueBook, VenueState
+from execution.oai_mm.order_manager import OrderManager, parse_order_result
 from execution.oai_mm.quote_engine import QuoteEngine
 from execution.oai_mm.risk_manager import RiskManager
 from execution.oai_mm.utils import decimal_places_for_float
@@ -169,6 +169,27 @@ class OaiMmTests(unittest.TestCase):
             }
         )
         self.assertEqual(rejected.status, "error")
+
+    def test_force_requote_respects_minimum_quote_lifetime(self) -> None:
+        manager = OrderManager(
+            self._config(min_quote_lifetime_ms=1_000),
+            logger=None,
+            inventory=InventoryManager(),
+            executor=None,
+            size_decimals=2,
+        )
+        active = ActiveOrder(
+            quote_side="bid",
+            is_buy=True,
+            cloid_raw="0x1",
+            price=100.0,
+            size=0.01,
+            placed_time_ms=10_000,
+        )
+        target = QuoteIntent(quote_side="bid", is_buy=True, px=101.0, size=0.01)
+
+        self.assertFalse(manager._needs_replace(active, target, observed_ms=10_500, force=True))
+        self.assertTrue(manager._needs_replace(active, target, observed_ms=11_000, force=True))
 
     def test_decimal_places_for_float_preserves_small_config_sizes(self) -> None:
         self.assertEqual(decimal_places_for_float(0.01), 2)

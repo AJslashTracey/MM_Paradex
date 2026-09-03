@@ -66,7 +66,8 @@ class HyperliquidExecutor:
                 "or run this executor on the server environment where it is installed."
             ) from exc
 
-        _install_hyperliquid_post_fallback(API, ClientError, ServerError)
+        if os.getenv("HYPERLIQUID_USE_URLLIB_FALLBACK") == "1":
+            _install_hyperliquid_post_fallback(API, ClientError, ServerError)
         base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self.wallet = Account.from_key(self.private_key)
         self.exchange = Exchange(

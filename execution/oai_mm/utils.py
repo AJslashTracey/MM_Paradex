@@ -9,8 +9,6 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from secrets import token_hex
 from typing import Any
 
-from hyperliquid.utils.types import Cloid
-
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
@@ -110,8 +108,16 @@ def side_to_is_buy(side: str | None) -> bool | None:
     return None
 
 
-def generate_cloid() -> Cloid:
-    return Cloid.from_str(f"0x{token_hex(16)}")
+def cloid_from_str(raw: str) -> Any:
+    try:
+        from hyperliquid.utils.types import Cloid
+    except ModuleNotFoundError:
+        return raw
+    return Cloid.from_str(raw)
+
+
+def generate_cloid() -> Any:
+    return cloid_from_str(f"0x{token_hex(16)}")
 
 
 def post_info(payload: dict[str, Any], timeout: float) -> Any:

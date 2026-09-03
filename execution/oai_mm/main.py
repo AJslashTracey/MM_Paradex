@@ -160,9 +160,24 @@ async def run_bot() -> int:
         asyncio.create_task(binance_feed.run(stop)),
         asyncio.create_task(strategy_loop()),
     ]
+    stop_task = asyncio.create_task(stop.wait())
     try:
-        await stop.wait()
+        done, _pending = await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task is stop_task:
+                continue
+            exc = task.exception()
+            if exc is not None:
+                logger.log_event("strategy_task_error", reason=str(exc), raw={"error": str(exc)})
+                raise exc
+            logger.log_event("strategy_task_stopped")
+            stop.set()
     finally:
+        stop_task.cancel()
+        try:
+            await stop_task
+        except asyncio.CancelledError:
+            pass
         for task in tasks:
             task.cancel()
         for task in tasks:

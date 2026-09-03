@@ -3,14 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from hyperliquid.utils.types import Cloid
-
 from execution.executor import HyperliquidExecutor
 
 from .config import MMConfig
 from .inventory_manager import InventoryManager
 from .models import ActiveOrder, FillRecord, QuoteIntent, QuotePlan
-from .utils import generate_cloid, round_down, safe_json, side_to_is_buy, signed_edge_bps, to_float
+from .utils import cloid_from_str, generate_cloid, round_down, safe_json, side_to_is_buy, signed_edge_bps, to_float
 
 
 @dataclass(frozen=True)
@@ -210,10 +208,10 @@ class OrderManager:
             self.pending_markouts.pop(fill_key, None)
 
     def _needs_replace(self, active: ActiveOrder, target: QuoteIntent, observed_ms: int, force: bool) -> bool:
-        if force:
-            return True
         if observed_ms - active.placed_time_ms < self.config.min_quote_lifetime_ms:
             return False
+        if force:
+            return True
         price_bps = abs(target.px - active.price) / target.px * 10_000
         if price_bps >= self.config.requote_threshold_bps:
             return True
@@ -228,7 +226,7 @@ class OrderManager:
             return True
         if self.config.live and self.executor is not None:
             try:
-                raw = self.executor.cancel_order_by_cloid(coin=self.config.target_coin, cloid=Cloid.from_str(active.cloid_raw))
+                raw = self.executor.cancel_order_by_cloid(coin=self.config.target_coin, cloid=cloid_from_str(active.cloid_raw))
             except Exception as exc:
                 self.logger.log_event("quote_cancel_error", reason=f"{reason}:{exc}", raw={"cloid": active.cloid_raw})
                 return False
