@@ -6,8 +6,11 @@ This module intentionally does nothing at import time. Instantiate
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -43,6 +46,8 @@ class HyperliquidExecutor:
         self,
         *,
         testnet: bool = True,
+        target_coin: str | None = None,
+        timeout_s: float | None = None,
         private_key_env: str = "PK",
         address_env: str = "ADDRESS",
         vault_address: str | None = None,
@@ -55,6 +60,8 @@ class HyperliquidExecutor:
         if not self.private_key or not self.address:
             raise ValueError(f"Missing {private_key_env} or {address_env} in environment/.env")
 
+        self.target_coin = target_coin
+        self.default_perp_dex = _coin_dex(target_coin)
         try:
             from hyperliquid.api import API
             from hyperliquid.exchange import Exchange
@@ -69,17 +76,23 @@ class HyperliquidExecutor:
         _install_hyperliquid_post_fallback(API, ClientError, ServerError)
         base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self.wallet = Account.from_key(self.private_key)
+        exchange_kwargs: dict[str, Any] = {
+            "wallet": self.wallet,
+            "base_url": base_url,
+            "account_address": self.address,
+            "vault_address": vault_address,
+            "timeout": timeout_s,
+        }
+        if self.default_perp_dex is not None:
+            exchange_kwargs["perp_dexs"] = [self.default_perp_dex]
         self.exchange = Exchange(
-            wallet=self.wallet,
-            base_url=base_url,
-            account_address=self.address,
-            vault_address=vault_address,
+            **exchange_kwargs,
         )
         self.info = self.exchange.info
 
-    def get_positions(self) -> dict[str, Position]:
+    def get_positions(self, coin: str | None = None) -> dict[str, Position]:
         """Return nonzero perp positions keyed by coin."""
-        state = self.info.user_state(self.address)
+        state = self.info.user_state(self.address, dex=self._resolve_dex(coin))
         positions: dict[str, Position] = {}
         for item in state.get("assetPositions", []):
             raw_position = item.get("position", {})
@@ -98,10 +111,10 @@ class HyperliquidExecutor:
         return positions
 
     def get_position(self, coin: str) -> Position | None:
-        return self.get_positions().get(coin)
+        return self.get_positions(coin).get(coin)
 
     def get_open_orders(self, coin: str | None = None) -> list[dict[str, Any]]:
-        orders = self.info.open_orders(self.address)
+        orders = self.info.open_orders(self.address, dex=self._resolve_dex(coin))
         if coin is None:
             return orders
         return [order for order in orders if order.get("coin") == coin]
@@ -114,7 +127,7 @@ class HyperliquidExecutor:
         aggregate_by_time: bool = False,
     ) -> list[dict[str, Any]]:
         if start_time_ms is None:
-            fills = self.info.user_fills(self.address, aggregate_by_time=aggregate_by_time)
+            fills = self.info.user_fills(self.address)
         else:
             fills = self.info.user_fills_by_time(
                 self.address,
@@ -218,6 +231,10 @@ class HyperliquidExecutor:
     def set_leverage(self, *, coin: str, leverage: int, cross: bool = False) -> dict[str, Any]:
         return self.exchange.update_leverage(leverage, coin, is_cross=cross)
 
+    def _resolve_dex(self, coin: str | None = None) -> str:
+        dex = _coin_dex(coin) or self.default_perp_dex
+        return "" if dex is None else dex
+
 
 def _float(value: Any) -> float | None:
     if value is None:
@@ -226,6 +243,13 @@ def _float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _coin_dex(coin: str | None) -> str | None:
+    if not coin or ":" not in coin:
+        return None
+    dex, _symbol = coin.split(":", 1)
+    return dex or None
 
 
 def _install_hyperliquid_post_fallback(api_cls: type, client_error_cls: type[Exception], server_error_cls: type[Exception]) -> None:
@@ -238,30 +262,45 @@ def _install_hyperliquid_post_fallback(api_cls: type, client_error_cls: type[Exc
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": "arbitrage-on-xyz/1.0"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                text = response.read().decode("utf-8")
-                try:
-                    return json.loads(text)
-                except ValueError:
-                    return {"error": f"Could not parse JSON: {text}"}
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            if 400 <= exc.code < 500:
-                try:
-                    err = json.loads(body)
-                except JSONDecodeError as parse_exc:
-                    raise client_error_cls(exc.code, None, body, None, exc.headers) from parse_exc
-                if err is None:
-                    raise client_error_cls(exc.code, None, body, None, exc.headers)
-                error_data = err.get("data")
-                raise client_error_cls(exc.code, err.get("code"), err.get("msg", body), exc.headers, error_data)
-            raise server_error_cls(exc.code, body)
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Hyperliquid API request failed: {exc.reason}") from exc
+        for attempt in range(1, 4):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    text = response.read().decode("utf-8")
+                    try:
+                        return json.loads(text)
+                    except ValueError:
+                        return {"error": f"Could not parse JSON: {text}"}
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < 3:
+                    time.sleep(0.25 * attempt)
+                    continue
+                if 400 <= exc.code < 500:
+                    try:
+                        err = json.loads(body)
+                    except JSONDecodeError as parse_exc:
+                        raise client_error_cls(exc.code, None, body, None, exc.headers) from parse_exc
+                    if err is None:
+                        raise client_error_cls(exc.code, None, body, None, exc.headers)
+                    error_data = err.get("data")
+                    raise client_error_cls(exc.code, err.get("code"), err.get("msg", body), exc.headers, error_data)
+                raise server_error_cls(exc.code, body)
+            except (
+                urllib.error.URLError,
+                http.client.RemoteDisconnected,
+                ConnectionResetError,
+                TimeoutError,
+                socket.timeout,
+                ssl.SSLError,
+            ) as exc:
+                if attempt < 3:
+                    time.sleep(0.25 * attempt)
+                    continue
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+                raise RuntimeError(f"Hyperliquid API request failed: {reason}") from exc
 
     api_cls.post = post_via_urllib
     api_cls._codex_urllib_fallback_installed = True

@@ -1,7 +1,12 @@
+import http.client
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+from execution.executor import HyperliquidExecutor, _install_hyperliquid_post_fallback
 from execution.oai_mm.basis_estimator import BasisEstimator
 from execution.oai_mm.binance_feed import apply_binance_message, binance_stream_url
 from execution.oai_mm.config import MMConfig
@@ -173,6 +178,118 @@ class OaiMmTests(unittest.TestCase):
     def test_decimal_places_for_float_preserves_small_config_sizes(self) -> None:
         self.assertEqual(decimal_places_for_float(0.01), 2)
         self.assertEqual(decimal_places_for_float(1.0), 0)
+
+    def test_hyperliquid_executor_initializes_builder_dex_for_prefixed_coin(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeAPI:
+            pass
+
+        class FakeClientError(Exception):
+            pass
+
+        class FakeServerError(Exception):
+            pass
+
+        class FakeExchange:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+                self.info = SimpleNamespace()
+
+        with (
+            mock.patch.dict(os.environ, {"PK": "0x" + "11" * 32, "ADDRESS": "0x" + "22" * 20}, clear=False),
+            mock.patch("execution.executor.load_dotenv"),
+            mock.patch("execution.executor.Account.from_key", return_value="wallet"),
+            mock.patch("hyperliquid.api.API", FakeAPI),
+            mock.patch("hyperliquid.exchange.Exchange", FakeExchange),
+            mock.patch("hyperliquid.utils.constants.MAINNET_API_URL", "https://mainnet.example"),
+            mock.patch("hyperliquid.utils.constants.TESTNET_API_URL", "https://testnet.example"),
+            mock.patch("hyperliquid.utils.error.ClientError", FakeClientError),
+            mock.patch("hyperliquid.utils.error.ServerError", FakeServerError),
+        ):
+            executor = HyperliquidExecutor(testnet=False, target_coin="io:OAI", timeout_s=12.5)
+
+        self.assertEqual(executor.default_perp_dex, "io")
+        self.assertEqual(captured["perp_dexs"], ["io"])
+        self.assertEqual(captured["timeout"], 12.5)
+        self.assertEqual(captured["account_address"], "0x" + "22" * 20)
+
+    def test_hyperliquid_executor_scopes_state_queries_to_builder_dex(self) -> None:
+        class FakeInfo:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, str]] = []
+
+            def user_state(self, address: str, dex: str = "") -> dict[str, object]:
+                self.calls.append(("user_state", address, dex))
+                return {
+                    "assetPositions": [
+                        {
+                            "position": {
+                                "coin": "io:OAI",
+                                "szi": "0.02",
+                                "entryPx": "1350.5",
+                                "unrealizedPnl": "1.25",
+                                "liquidationPx": "1200.0",
+                            }
+                        }
+                    ]
+                }
+
+            def open_orders(self, address: str, dex: str = "") -> list[dict[str, object]]:
+                self.calls.append(("open_orders", address, dex))
+                return [{"coin": "io:OAI", "oid": 7}]
+
+        fake_info = FakeInfo()
+        executor = HyperliquidExecutor.__new__(HyperliquidExecutor)
+        executor.address = "0xabc"
+        executor.default_perp_dex = "io"
+        executor.info = fake_info
+
+        position = executor.get_position("io:OAI")
+        orders = executor.get_open_orders("io:OAI")
+
+        self.assertIsNotNone(position)
+        self.assertAlmostEqual(position.size, 0.02)
+        self.assertEqual(orders, [{"coin": "io:OAI", "oid": 7}])
+        self.assertEqual(
+            fake_info.calls,
+            [
+                ("user_state", "0xabc", "io"),
+                ("open_orders", "0xabc", "io"),
+            ],
+        )
+
+    def test_hyperliquid_post_fallback_retries_remote_disconnect(self) -> None:
+        class FakeAPI:
+            base_url = "https://api.example"
+            timeout = 5.0
+
+        class FakeClientError(Exception):
+            pass
+
+        class FakeServerError(Exception):
+            pass
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        _install_hyperliquid_post_fallback(FakeAPI, FakeClientError, FakeServerError)
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=[http.client.RemoteDisconnected("eof"), FakeResponse()]) as urlopen,
+            mock.patch("execution.executor.time.sleep"),
+        ):
+            result = FakeAPI().post("/info", {"type": "meta"})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
 
 
 if __name__ == "__main__":

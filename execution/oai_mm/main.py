@@ -25,7 +25,15 @@ async def run_bot() -> int:
     binance_state = VenueState(venue="binance", symbol=config.binance_symbol)
     state = BotState(hl=hl_state, binance=binance_state)
     inventory = InventoryManager()
-    executor = HyperliquidExecutor(testnet=config.testnet) if config.live else None
+    executor = (
+        HyperliquidExecutor(
+            testnet=config.testnet,
+            target_coin=config.target_coin,
+            timeout_s=config.http_timeout,
+        )
+        if config.live
+        else None
+    )
     size_decimals = (
         load_size_decimals(config.target_coin, config.http_timeout)
         if config.live
