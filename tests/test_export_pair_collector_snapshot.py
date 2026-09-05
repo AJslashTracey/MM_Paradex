@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +67,46 @@ class ExportPairCollectorSnapshotTests(unittest.TestCase):
             readme = (export_dir / "README.md").read_text()
             self.assertIn("io:OAI|binance:OPENAIUSDT", readme)
             self.assertIn("clean rows", readme)
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is not installed")
+    def test_exports_compressed_time_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            pair_dir = temp_path / "io_OAI__binance_OPENAIUSDT"
+            pair_dir.mkdir()
+            (pair_dir / "market_data.csv").write_text(MARKET_DATA)
+            (pair_dir / "collector_events.csv").write_text(COLLECTOR_EVENTS)
+            (pair_dir / "collector_fills.csv").write_text(COLLECTOR_FILLS)
+
+            export_dir = export_snapshot(
+                [str(pair_dir)],
+                temp_path / "review_exports",
+                export_name="compressed-window",
+                compression="zstd",
+                last_hours=0.5 / 3600,
+            )
+
+            market_path = export_dir / "io_OAI__binance_OPENAIUSDT_market_data.csv.zst"
+            self.assertTrue(market_path.is_file())
+            self.assertFalse((export_dir / "io_OAI__binance_OPENAIUSDT_market_data.csv").exists())
+            decompressed = subprocess.run(
+                ["zstd", "-q", "-d", "-c", str(market_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertNotIn("09:00:00.000Z", decompressed)
+            self.assertIn("09:00:00.500Z", decompressed)
+            self.assertIn("09:00:01.000Z", decompressed)
+
+            summary = json.loads((export_dir / "summary.json").read_text())
+            pair_summary = summary["pairs"]["io:OAI|binance:OPENAIUSDT"]
+            self.assertEqual(summary["compression"], "zstd")
+            self.assertEqual(pair_summary["rows"], 2)
+            self.assertEqual(pair_summary["collector_event_rows"], 0)
+            self.assertEqual(pair_summary["collector_fill_rows"], 0)
+            self.assertEqual(pair_summary["window_start_utc"], "2026-09-03T09:00:00.500Z")
+            self.assertEqual(pair_summary["window_end_utc"], "2026-09-03T09:00:01.000Z")
 
 
 if __name__ == "__main__":
