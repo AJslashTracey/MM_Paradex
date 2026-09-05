@@ -7,8 +7,18 @@ from execution.executor import HyperliquidExecutor
 
 from .config import MMConfig
 from .inventory_manager import InventoryManager
-from .models import ActiveOrder, FillRecord, QuoteIntent, QuotePlan
-from .utils import cloid_from_str, generate_cloid, round_down, safe_json, side_to_is_buy, signed_edge_bps, to_float
+from .models import ActiveOrder, FillRecord, QuoteIntent, QuotePlan, VenueState
+from .utils import (
+    cloid_from_str,
+    generate_cloid,
+    now_ms,
+    round_down,
+    round_price,
+    safe_json,
+    side_to_is_buy,
+    signed_edge_bps,
+    to_float,
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,14 @@ class OrderManager:
         self.active_orders: dict[str, ActiveOrder] = {}
         self.seen_fill_keys: set[str] = set()
         self.last_deadman_refresh_ms = 0
+        self.last_live_order_action_ms = 0
+        self.live_order_blocked_until_ms = 0
+        self.live_entries_halted_reason: str | None = None
+        self.last_emergency_cancel_ms = 0
+        self.last_flatten_attempt_ms = 0
+        self.last_unresolved_position_alert_ms = 0
+        self.cancel_all_in_flight = False
+        self.flatten_in_flight = False
         self.pending_markouts: dict[str, dict[str, Any]] = {}
 
     def total_open_notional(self) -> float:
@@ -43,6 +61,8 @@ class OrderManager:
     def refresh_deadman(self, observed_ms: int) -> None:
         if not self.config.live or self.executor is None:
             return
+        if self.config.deadman_ms <= 0:
+            return
         if observed_ms - self.last_deadman_refresh_ms < self.config.deadman_refresh_ms:
             return
         raw = self.executor.schedule_cancel_all(ms_from_now=self.config.deadman_ms)
@@ -50,16 +70,39 @@ class OrderManager:
         self.logger.log_event("deadman_refresh", raw=raw)
 
     def cancel_all(self, reason: str, emergency: bool = False) -> None:
-        if not self.active_orders and not (emergency and self.config.live and self.executor is not None):
+        if not self.active_orders and not (
+            emergency
+            and self.config.live
+            and self.executor is not None
+            and self.config.live_cancel_all_when_no_active_orders
+        ):
+            if emergency and self.config.live and self.executor is not None:
+                self.logger.log_event("cancel_all_skip", reason="no_active_orders")
             return
         if self.config.live and self.executor is not None:
             if emergency:
-                raw = self.executor.cancel_all_for_coin(self.config.target_coin)
-                self.active_orders.clear()
-                self.logger.log_event("cancel_all", reason=reason, raw=raw)
+                current_ms = now_ms()
+                if self.cancel_all_in_flight:
+                    self.logger.log_event("cancel_all_skip", reason="cancel_all_in_flight")
+                    return
+                if (
+                    reason != "shutdown"
+                    and current_ms - self.last_emergency_cancel_ms < self.config.live_cancel_all_min_interval_ms
+                ):
+                    self.logger.log_event("cancel_all_skip", reason="live_cancel_all_throttle")
+                    return
+                self.cancel_all_in_flight = True
+                try:
+                    self.last_emergency_cancel_ms = current_ms
+                    self.last_live_order_action_ms = current_ms
+                    raw = self.executor.cancel_all_for_coin(self.config.target_coin)
+                    self.active_orders.clear()
+                    self.logger.log_event("cancel_all", reason=reason, raw=raw)
+                finally:
+                    self.cancel_all_in_flight = False
                 return
             for side in list(self.active_orders):
-                self._cancel_one(side, reason)
+                self._cancel_one(side, reason, current_ms=now_ms())
             return
         for side in list(self.active_orders):
             order = self.active_orders.pop(side)
@@ -70,20 +113,29 @@ class OrderManager:
             "bid": None if block_bid else plan.bid,
             "ask": None if block_ask else plan.ask,
         }
-        for side in ("bid", "ask"):
+        if self.inventory.inventory > 0:
+            side_order = ("ask", "bid")
+        elif self.inventory.inventory < 0:
+            side_order = ("bid", "ask")
+        else:
+            side_order = ("bid", "ask")
+        for side in side_order:
             active = self.active_orders.get(side)
             target = desired[side]
+            reduce_only = (side == "ask" and self.inventory.inventory > 0) or (
+                side == "bid" and self.inventory.inventory < 0
+            )
             if active is not None and target is None:
-                self._cancel_one(side, "side_blocked")
+                self._cancel_one(side, "side_blocked", current_ms=observed_ms)
                 continue
             if active is None and target is not None:
-                self._place_one(target, observed_ms, reason="new_quote")
+                self._place_one(target, observed_ms, reason="new_quote", reduce_only=reduce_only)
                 continue
             if active is None or target is None:
                 continue
             if self._needs_replace(active, target, observed_ms, force):
-                if self._cancel_one(side, "requote"):
-                    self._place_one(target, observed_ms, reason="requote")
+                if self._cancel_one(side, "requote", current_ms=observed_ms):
+                    self._place_one(target, observed_ms, reason="requote", reduce_only=reduce_only)
 
     def maybe_paper_fill_cross(self, hl_bid: float | None, hl_ask: float | None, fair_value: Any, observed_ms: int) -> None:
         if not self.config.paper_fill_on_cross:
@@ -114,6 +166,136 @@ class OrderManager:
         }
         self.active_orders.pop(order.quote_side, None)
         self.handle_fill(raw_fill, fair_value, observed_ms)
+
+    def has_active_reducing_order(self, position_size: float) -> bool:
+        if position_size > 0:
+            order = self.active_orders.get("ask")
+        elif position_size < 0:
+            order = self.active_orders.get("bid")
+        else:
+            return False
+        if order is None:
+            return False
+        remaining = order.remaining_size if order.remaining_size is not None else order.size
+        return order.reduce_only and remaining >= abs(position_size) - self.config.position_reconcile_tolerance
+
+    def cancel_non_reducing_orders(self, reason: str, observed_ms: int) -> None:
+        for side, order in list(self.active_orders.items()):
+            if order.reduce_only:
+                continue
+            self._cancel_one(side, reason, current_ms=observed_ms)
+
+    def flatten_position_if_needed(self, position_size: float, hl_state: VenueState, observed_ms: int, reason: str) -> None:
+        if abs(position_size) <= self.config.position_reconcile_tolerance:
+            return
+        if self.has_active_reducing_order(position_size):
+            self._log_flatten_skip("reducing_limit_active", observed_ms, position_size)
+            return
+        if self.flatten_in_flight:
+            self._log_flatten_skip("flatten_in_flight", observed_ms, position_size)
+            return
+        if (
+            self.last_flatten_attempt_ms > 0
+            and observed_ms - self.last_flatten_attempt_ms < self.config.flatten_cooldown_ms
+        ):
+            remaining_ms = self.config.flatten_cooldown_ms - (observed_ms - self.last_flatten_attempt_ms)
+            self._log_flatten_skip(f"flatten_cooldown:{remaining_ms}ms", observed_ms, position_size)
+            return
+        if not hl_state.connected or not hl_state.is_fresh(observed_ms, self.config.max_data_age_ms):
+            stale_reason = "hyperliquid_stale" if hl_state.connected else "hyperliquid_disconnected"
+            self._alert_unresolved_position(stale_reason, observed_ms, position_size)
+            return
+        if hl_state.book is None:
+            self._alert_unresolved_position("missing_hyperliquid_book", observed_ms, position_size)
+            return
+
+        is_buy = position_size < 0
+        level = hl_state.book.best_ask() if is_buy else hl_state.book.best_bid()
+        if level is None:
+            self._alert_unresolved_position("missing_exit_level", observed_ms, position_size)
+            return
+
+        size = round_down(abs(position_size), self.size_decimals)
+        if size <= 0:
+            self._alert_unresolved_position("position_size_rounds_to_zero", observed_ms, position_size)
+            return
+
+        decimals = hl_state.book.price_decimals()
+        price_multiplier = 1.0 + self.config.exit_ioc_price_protection_bps / 10_000 if is_buy else 1.0 - self.config.exit_ioc_price_protection_bps / 10_000
+        limit_px = round_price(level.px * price_multiplier, decimals, "ask" if is_buy else "bid")
+        cloid = generate_cloid()
+
+        if not self.config.live or self.executor is None:
+            self.last_flatten_attempt_ms = observed_ms
+            self.logger.log_event(
+                "flatten_submit",
+                reason=f"dry_run:{reason}",
+                raw={"is_buy": is_buy, "size": size, "limit_px": limit_px, "position_size": position_size},
+            )
+            return
+
+        self.flatten_in_flight = True
+        self.last_flatten_attempt_ms = observed_ms
+        self.last_live_order_action_ms = observed_ms
+        try:
+            raw = self.executor.exit_reduce_only_ioc(
+                coin=self.config.target_coin,
+                is_buy=is_buy,
+                size=size,
+                limit_px=limit_px,
+                cloid=cloid,
+            )
+        except Exception as exc:
+            self.logger.log_event(
+                "flatten_error",
+                reason=str(exc),
+                raw={"is_buy": is_buy, "size": size, "limit_px": limit_px, "position_size": position_size},
+            )
+            return
+        finally:
+            self.flatten_in_flight = False
+
+        parsed = parse_order_result(raw)
+        if parsed.status == "error":
+            self._record_request_limit(parsed.error, observed_ms, source="flatten")
+            self.logger.log_event("flatten_reject", reason=parsed.error, raw=raw)
+            return
+        if parsed.status == "resting":
+            quote_side = "bid" if is_buy else "ask"
+            self.active_orders[quote_side] = ActiveOrder(
+                quote_side=quote_side,
+                is_buy=is_buy,
+                cloid_raw=str(cloid),
+                price=limit_px,
+                size=size,
+                placed_time_ms=observed_ms,
+                order_id=parsed.order_id,
+                remaining_size=size,
+                status="resting",
+                reduce_only=True,
+            )
+        self.logger.log_event(
+            "flatten_submit",
+            reason=f"{reason}:{parsed.status}",
+            raw={"is_buy": is_buy, "size": size, "limit_px": limit_px, "position_size": position_size, "result": raw},
+        )
+
+    def ingest_open_orders(self, orders: list[dict[str, Any]], observed_ms: int, reason: str) -> None:
+        for order in orders:
+            self._upsert_exchange_order(order, observed_ms)
+        self.logger.log_event("open_orders_reconcile", reason=reason, raw={"orders": orders})
+
+    def handle_order_update(self, payload: dict[str, Any], observed_ms: int) -> None:
+        self.logger.log_event("order_update", raw=payload)
+        order = payload.get("order") if isinstance(payload, dict) else None
+        status = str(payload.get("status", "")) if isinstance(payload, dict) else ""
+        if not isinstance(order, dict) or order.get("coin") != self.config.target_coin:
+            return
+        active = self._upsert_exchange_order(order, observed_ms)
+        if active is not None:
+            active.status = status or active.status
+        if status in {"filled", "canceled", "rejected", "marginCanceled"}:
+            self._remove_matching_order(order)
 
     def handle_fill(self, fill: dict[str, Any], fair_value: Any, observed_ms: int) -> FillRecord | None:
         fill_key = str(fill.get("tid") or fill.get("hash") or fill.get("oid") or safe_json(fill))
@@ -220,13 +402,27 @@ class OrderManager:
             return True
         return False
 
-    def _cancel_one(self, side: str, reason: str) -> bool:
+    def _cancel_one(self, side: str, reason: str, current_ms: int | None = None) -> bool:
         active = self.active_orders.get(side)
         if active is None:
             return True
         if self.config.live and self.executor is not None:
+            current_ms = now_ms() if current_ms is None else current_ms
+            throttle_reason = self._live_order_throttle_reason(current_ms, allow_reduce_only=active.reduce_only)
+            if throttle_reason is not None:
+                self.logger.log_event("quote_cancel_skip", reason=throttle_reason, raw={"cloid": active.cloid_raw})
+                return False
+            self.last_live_order_action_ms = current_ms
             try:
-                raw = self.executor.cancel_order_by_cloid(coin=self.config.target_coin, cloid=cloid_from_str(active.cloid_raw))
+                if active.cloid_raw:
+                    raw = self.executor.cancel_order_by_cloid(
+                        coin=self.config.target_coin,
+                        cloid=cloid_from_str(active.cloid_raw),
+                    )
+                elif active.order_id is not None:
+                    raw = self.executor.cancel_order(coin=self.config.target_coin, oid=active.order_id)
+                else:
+                    raise RuntimeError("active order has neither cloid nor oid")
             except Exception as exc:
                 self.logger.log_event("quote_cancel_error", reason=f"{reason}:{exc}", raw={"cloid": active.cloid_raw})
                 return False
@@ -236,13 +432,13 @@ class OrderManager:
         self.active_orders.pop(side, None)
         return True
 
-    def _place_one(self, target: QuoteIntent, observed_ms: int, reason: str) -> None:
+    def _place_one(self, target: QuoteIntent, observed_ms: int, reason: str, reduce_only: bool = False) -> None:
         rounded_size = round_down(min(target.size, self.config.max_order_size), self.size_decimals)
         if rounded_size <= 0:
             self.logger.log_event("quote_skip", reason="size_rounds_to_zero", raw={"quote_side": target.quote_side})
             return
         projected_open_notional = self.total_open_notional() + (rounded_size * target.px)
-        if projected_open_notional > self.config.max_open_notional:
+        if not reduce_only and projected_open_notional > self.config.max_open_notional:
             self.logger.log_event(
                 "quote_skip",
                 reason="max_open_notional",
@@ -251,17 +447,23 @@ class OrderManager:
             return
         cloid = generate_cloid()
         if self.config.live and self.executor is not None:
+            throttle_reason = self._live_order_throttle_reason(observed_ms, allow_reduce_only=reduce_only)
+            if throttle_reason is not None:
+                self.logger.log_event("quote_skip", reason=throttle_reason, raw={"quote_side": target.quote_side})
+                return
+            self.last_live_order_action_ms = observed_ms
             raw = self.executor.place_limit_order(
                 coin=self.config.target_coin,
                 is_buy=target.is_buy,
                 size=rounded_size,
                 limit_px=target.px,
                 tif="Alo",
-                reduce_only=False,
+                reduce_only=reduce_only,
                 cloid=cloid,
             )
             parsed = parse_order_result(raw)
             if parsed.status != "resting":
+                self._record_request_limit(parsed.error, observed_ms, source="entry")
                 self.logger.log_event("quote_reject", reason=parsed.error or parsed.status, raw=raw)
                 return
             order_id = parsed.order_id
@@ -279,15 +481,128 @@ class OrderManager:
             placed_time_ms=observed_ms,
             order_id=order_id,
             remaining_size=rounded_size,
+            reduce_only=reduce_only,
         )
+
+    def _live_order_throttle_reason(self, observed_ms: int, allow_reduce_only: bool = False) -> str | None:
+        if not self.config.live:
+            return None
+        if not allow_reduce_only and self.live_entries_halted_reason is not None:
+            return f"live_entry_halt:{self.live_entries_halted_reason}"
+        if not allow_reduce_only and observed_ms < self.live_order_blocked_until_ms:
+            remaining_ms = self.live_order_blocked_until_ms - observed_ms
+            return f"live_reject_cooldown:{remaining_ms}ms"
+        elapsed_ms = observed_ms - self.last_live_order_action_ms
+        if not allow_reduce_only and elapsed_ms < self.config.live_order_action_min_interval_ms:
+            return f"live_order_action_throttle:{self.config.live_order_action_min_interval_ms - elapsed_ms}ms"
+        return None
+
+    def _record_request_limit(self, error: str, observed_ms: int, source: str) -> None:
+        if "Too many cumulative requests" not in error:
+            return
+        self.live_order_blocked_until_ms = max(
+            self.live_order_blocked_until_ms,
+            observed_ms + self.config.live_reject_cooldown_ms,
+        )
+        if self.config.halt_entries_on_request_limit:
+            self.live_entries_halted_reason = f"request_limit:{source}"
+            if self.logger is not None:
+                self.logger.log_event("live_entry_halt", reason=self.live_entries_halted_reason, raw={"error": error})
+
+    def _alert_unresolved_position(self, reason: str, observed_ms: int, position_size: float) -> None:
+        if self.config.unresolved_position_alert_interval_ms <= 0:
+            return
+        if (
+            self.last_unresolved_position_alert_ms > 0
+            and observed_ms - self.last_unresolved_position_alert_ms < self.config.unresolved_position_alert_interval_ms
+        ):
+            return
+        self.last_unresolved_position_alert_ms = observed_ms
+        self.logger.log_event("unresolved_position_alert", reason=reason, raw={"position_size": position_size})
+
+    def _log_flatten_skip(self, reason: str, observed_ms: int, position_size: float) -> None:
+        self.logger.log_event("flatten_skip", reason=reason, raw={"position_size": position_size})
+
+    def _upsert_exchange_order(self, order: dict[str, Any], observed_ms: int) -> ActiveOrder | None:
+        quote_side = _quote_side_from_exchange_order(order)
+        price = to_float(order.get("limitPx") or order.get("px"))
+        size = to_float(order.get("sz") or order.get("origSz"))
+        if quote_side is None or price is None or size is None:
+            return None
+        order_id = int(order["oid"]) if order.get("oid") is not None else None
+        cloid_raw = str(order.get("cloid") or "")
+        timestamp = int(order.get("timestamp") or observed_ms)
+        reduce_only = _truthy(order.get("reduceOnly") if "reduceOnly" in order else order.get("reduce_only"))
+        active = self._find_matching_order(order)
+        if active is None:
+            active = ActiveOrder(
+                quote_side=quote_side,
+                is_buy=quote_side == "bid",
+                cloid_raw=cloid_raw,
+                price=price,
+                size=size,
+                placed_time_ms=timestamp,
+                order_id=order_id,
+                remaining_size=size,
+                reduce_only=reduce_only,
+            )
+            self.active_orders[quote_side] = active
+            return active
+        active.price = price
+        active.size = max(active.size, size)
+        active.remaining_size = size
+        active.order_id = order_id if order_id is not None else active.order_id
+        active.cloid_raw = cloid_raw or active.cloid_raw
+        active.reduce_only = reduce_only
+        return active
+
+    def _find_matching_order(self, order: dict[str, Any]) -> ActiveOrder | None:
+        oid = order.get("oid")
+        cloid = order.get("cloid")
+        for active in self.active_orders.values():
+            if oid is not None and active.order_id == int(oid):
+                return active
+            if cloid and active.cloid_raw == str(cloid):
+                return active
+        quote_side = _quote_side_from_exchange_order(order)
+        if quote_side is None:
+            return None
+        return self.active_orders.get(quote_side)
+
+    def _remove_matching_order(self, order: dict[str, Any]) -> None:
+        active = self._find_matching_order(order)
+        if active is not None:
+            self.active_orders.pop(active.quote_side, None)
+
+
+def _quote_side_from_exchange_order(order: dict[str, Any]) -> str | None:
+    is_buy = side_to_is_buy(str(order.get("side", "")))
+    if is_buy is None:
+        return None
+    return "bid" if is_buy else "ask"
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
 
 
 def parse_order_result(raw: Any) -> ParsedOrderResult:
     if not isinstance(raw, dict):
         return ParsedOrderResult(status="unknown", error="non_dict_response")
-    if raw.get("status") == "error":
-        return ParsedOrderResult(status="error", error=str(raw.get("error", "unknown_error")))
-    data = raw.get("response", {}).get("data", {})
+    if raw.get("status") in {"error", "err"}:
+        return ParsedOrderResult(status="error", error=str(raw.get("error") or raw.get("response") or "unknown_error"))
+    response = raw.get("response", {})
+    if not isinstance(response, dict):
+        return ParsedOrderResult(status="unknown", error=f"non_dict_response_field:{response}")
+    data = response.get("data", {})
+    if not isinstance(data, dict):
+        return ParsedOrderResult(status="unknown", error=f"non_dict_data_field:{data}")
     statuses = data.get("statuses", [])
     if not statuses:
         if "error" in raw:
@@ -298,7 +613,9 @@ def parse_order_result(raw: Any) -> ParsedOrderResult:
         oid = first["resting"].get("oid")
         return ParsedOrderResult(status="resting", order_id=None if oid is None else int(oid))
     if "filled" in first:
-        return ParsedOrderResult(status="filled")
+        filled = first["filled"]
+        oid = filled.get("oid") if isinstance(filled, dict) else None
+        return ParsedOrderResult(status="filled", order_id=None if oid is None else int(oid))
     if "error" in first:
         return ParsedOrderResult(status="error", error=str(first["error"]))
     return ParsedOrderResult(status="unknown", error=safe_json(first))

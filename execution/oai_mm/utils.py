@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import http.client
 import json
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -127,14 +130,29 @@ def post_info(payload: dict[str, Any], timeout: float) -> Any:
         headers={"Content-Type": "application/json", "User-Agent": "oai-mm/1.0"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Hyperliquid info HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"could not reach Hyperliquid info API: {exc.reason}") from exc
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code >= 500 and attempt < 3:
+                time.sleep(0.25 * attempt)
+                continue
+            raise RuntimeError(f"Hyperliquid info HTTP {exc.code}: {body}") from exc
+        except (
+            urllib.error.URLError,
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+            TimeoutError,
+            socket.timeout,
+            ssl.SSLError,
+        ) as exc:
+            if attempt < 3:
+                time.sleep(0.25 * attempt)
+                continue
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+            raise RuntimeError(f"could not reach Hyperliquid info API: {reason}") from exc
 
 
 def load_size_decimals(coin: str, timeout: float) -> int:

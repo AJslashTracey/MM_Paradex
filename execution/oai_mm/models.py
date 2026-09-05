@@ -157,6 +157,7 @@ class ActiveOrder:
     order_id: int | None = None
     remaining_size: float | None = None
     status: str = "resting"
+    reduce_only: bool = False
 
     @property
     def open_notional(self) -> float:
@@ -171,6 +172,49 @@ class RiskDecision:
     reason: str | None
     block_bid: bool = False
     block_ask: bool = False
+
+
+@dataclass
+class PositionReconciliation:
+    internal_inventory: float = 0.0
+    exchange_position: float | None = None
+    exchange_entry_px: float | None = None
+    exchange_unrealized_pnl: float | None = None
+    diff: float | None = None
+    mismatch: bool = False
+    last_reconcile_ms: int | None = None
+    last_error: str | None = None
+
+    def update_internal(self, inventory: float, tolerance: float) -> None:
+        self.internal_inventory = inventory
+        self._refresh_diff(tolerance)
+
+    def update_exchange(
+        self,
+        position: float,
+        entry_px: float | None,
+        unrealized_pnl: float | None,
+        observed_ms: int,
+        tolerance: float,
+    ) -> None:
+        self.exchange_position = position
+        self.exchange_entry_px = entry_px
+        self.exchange_unrealized_pnl = unrealized_pnl
+        self.last_reconcile_ms = observed_ms
+        self.last_error = None
+        self._refresh_diff(tolerance)
+
+    def mark_error(self, error: str, observed_ms: int) -> None:
+        self.last_error = error
+        self.last_reconcile_ms = observed_ms
+
+    def _refresh_diff(self, tolerance: float) -> None:
+        if self.exchange_position is None:
+            self.diff = None
+            self.mismatch = False
+            return
+        self.diff = self.exchange_position - self.internal_inventory
+        self.mismatch = abs(self.diff) > tolerance
 
 
 @dataclass(frozen=True)
@@ -223,4 +267,4 @@ class BotState:
     fair_value: FairValueSnapshot | None = None
     quote_plan: QuotePlan | None = None
     risk: RiskDecision | None = None
-
+    position_reconciliation: PositionReconciliation = field(default_factory=PositionReconciliation)

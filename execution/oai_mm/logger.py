@@ -46,14 +46,24 @@ EVENT_FIELDS = [
     "realized_pnl",
     "unrealized_pnl",
     "total_fees",
+    "exchange_position",
+    "position_diff",
+    "position_mismatch",
+    "position_last_reconcile_ms",
+    "live_entry_halt_reason",
+    "hl_book_age_ms",
+    "binance_book_age_ms",
+    "cross_recv_skew_ms",
     "active_bid_px",
     "active_bid_sz",
     "active_bid_oid",
     "active_bid_cloid",
+    "active_bid_reduce_only",
     "active_ask_px",
     "active_ask_sz",
     "active_ask_oid",
     "active_ask_cloid",
+    "active_ask_reduce_only",
     "desired_bid_px",
     "desired_bid_sz",
     "desired_ask_px",
@@ -117,6 +127,8 @@ class MMLogger:
         self.state = state
         self.inventory = inventory
         self.order_manager = order_manager
+        self._last_console_status_ms = 0
+        self._last_console_skip_by_key: dict[str, int] = {}
         config.out_dir.mkdir(parents=True, exist_ok=True)
         self._event_writer, self._event_file = self._open_csv(config.event_log, EVENT_FIELDS)
         self._market_writer, self._market_file = self._open_csv(config.market_log, MARKET_FIELDS)
@@ -144,6 +156,17 @@ class MMLogger:
         binance_book = self.state.binance.book
         plan = self.state.quote_plan
         risk = self.state.risk
+        reconciliation = self.state.position_reconciliation
+        hl_age_ms = self.state.hl.book_age_ms(observed_ms)
+        binance_age_ms = self.state.binance.book_age_ms(observed_ms)
+        cross_recv_skew_ms = (
+            None
+            if hl_book is None
+            or binance_book is None
+            or hl_book.recv_time_ms is None
+            or binance_book.recv_time_ms is None
+            else abs(hl_book.recv_time_ms - binance_book.recv_time_ms)
+        )
         return {
             "time_utc": utc_iso(observed_ms),
             "time_ms": observed_ms,
@@ -178,14 +201,24 @@ class MMLogger:
             "realized_pnl": f"{inventory_snapshot.realized_pnl:.10f}",
             "unrealized_pnl": "" if inventory_snapshot.unrealized_pnl is None else f"{inventory_snapshot.unrealized_pnl:.10f}",
             "total_fees": f"{inventory_snapshot.total_fees:.10f}",
+            "exchange_position": "" if reconciliation.exchange_position is None else f"{reconciliation.exchange_position:.10f}",
+            "position_diff": "" if reconciliation.diff is None else f"{reconciliation.diff:.10f}",
+            "position_mismatch": str(reconciliation.mismatch).lower(),
+            "position_last_reconcile_ms": "" if reconciliation.last_reconcile_ms is None else reconciliation.last_reconcile_ms,
+            "live_entry_halt_reason": "" if self.order_manager.live_entries_halted_reason is None else self.order_manager.live_entries_halted_reason,
+            "hl_book_age_ms": "" if hl_age_ms is None else hl_age_ms,
+            "binance_book_age_ms": "" if binance_age_ms is None else binance_age_ms,
+            "cross_recv_skew_ms": "" if cross_recv_skew_ms is None else cross_recv_skew_ms,
             "active_bid_px": "" if bid_order is None else bid_order.price,
             "active_bid_sz": "" if bid_order is None else bid_order.remaining_size if bid_order.remaining_size is not None else bid_order.size,
             "active_bid_oid": "" if bid_order is None or bid_order.order_id is None else bid_order.order_id,
             "active_bid_cloid": "" if bid_order is None else bid_order.cloid_raw,
+            "active_bid_reduce_only": "" if bid_order is None else str(bid_order.reduce_only).lower(),
             "active_ask_px": "" if ask_order is None else ask_order.price,
             "active_ask_sz": "" if ask_order is None else ask_order.remaining_size if ask_order.remaining_size is not None else ask_order.size,
             "active_ask_oid": "" if ask_order is None or ask_order.order_id is None else ask_order.order_id,
             "active_ask_cloid": "" if ask_order is None else ask_order.cloid_raw,
+            "active_ask_reduce_only": "" if ask_order is None else str(ask_order.reduce_only).lower(),
             "desired_bid_px": "" if plan is None or plan.bid is None else plan.bid.px,
             "desired_bid_sz": "" if plan is None or plan.bid is None else plan.bid.size,
             "desired_ask_px": "" if plan is None or plan.ask is None else plan.ask.px,
@@ -208,6 +241,7 @@ class MMLogger:
         row["raw_json"] = "" if raw is None else safe_json(raw)
         self._event_writer.writerow(row)
         self._event_file.flush()
+        self._maybe_print_event(event, reason, raw, observed_ms)
 
     def log_market_snapshot(self, observed_ms: int) -> None:
         row = self._common_row(observed_ms)
@@ -216,6 +250,7 @@ class MMLogger:
         row["raw_json"] = ""
         self._market_writer.writerow(row)
         self._market_file.flush()
+        self._maybe_print_status(observed_ms)
 
     def log_fill(self, record_type: str, fill: FillRecord, markouts: dict[int, float | None], markouts_complete: bool) -> None:
         row = {
@@ -263,3 +298,199 @@ class MMLogger:
         }
         self._fill_writer.writerow(row)
         self._fill_file.flush()
+        print(
+            f"[{utc_iso()}] fill {fill.side} sz={_fmt_float(fill.size, 4)} px={_fmt_float(fill.price, 4)} "
+            f"inv={_fmt_float(fill.inventory_after, 4)} realized={_fmt_float(fill.total_realized_pnl, 4)}",
+            flush=True,
+        )
+
+    def _maybe_print_status(self, observed_ms: int) -> None:
+        interval_ms = self.config.console_status_interval_ms
+        if interval_ms <= 0:
+            return
+        if observed_ms - self._last_console_status_ms < interval_ms:
+            return
+        self._last_console_status_ms = observed_ms
+        fair = self.state.fair_value
+        risk = self.state.risk
+        bid_order = self.order_manager.active_orders.get("bid")
+        ask_order = self.order_manager.active_orders.get("ask")
+        hl_age = self.state.hl.book_age_ms(observed_ms)
+        binance_age = self.state.binance.book_age_ms(observed_ms)
+        reconciliation = self.state.position_reconciliation
+        cross_recv_skew_ms = None
+        if (
+            self.state.hl.book is not None
+            and self.state.binance.book is not None
+            and self.state.hl.book.recv_time_ms is not None
+            and self.state.binance.book.recv_time_ms is not None
+        ):
+            cross_recv_skew_ms = abs(self.state.hl.book.recv_time_ms - self.state.binance.book.recv_time_ms)
+        status = "quoting" if risk is not None and risk.quoting_allowed else f"paused:{'' if risk is None else risk.reason}"
+        if self.order_manager.live_entries_halted_reason is not None:
+            status = f"entry_halted:{self.order_manager.live_entries_halted_reason}"
+        elif reconciliation.mismatch:
+            status = "entry_halted:position_mismatch"
+        elif reconciliation.exchange_position is not None and abs(reconciliation.exchange_position) > self.config.position_reconcile_tolerance:
+            status = "flattening:exchange_position"
+        print(
+            f"[{utc_iso(observed_ms)}] status {status} "
+            f"io={_fmt_float(self.state.hl.mid(), 4)} fair={_fmt_float(None if fair is None else fair.fair_px, 4)} "
+            f"dev={_fmt_float(None if fair is None else fair.io_deviation_bps, 2)}bps "
+            f"bin5s={_fmt_float(None if fair is None else fair.binance_ret_5s_bps, 2)}bps "
+            f"inv={_fmt_float(self.inventory.inventory, 4)} exch_pos={_fmt_float(reconciliation.exchange_position, 4)} "
+            f"diff={_fmt_float(reconciliation.diff, 4)} "
+            f"active_bid={_fmt_order(bid_order)} active_ask={_fmt_order(ask_order)} "
+            f"age_hl={_fmt_ms(hl_age)} age_bin={_fmt_ms(binance_age)} skew={_fmt_ms(cross_recv_skew_ms)}",
+            flush=True,
+        )
+
+    def _maybe_print_event(self, event: str, reason: str | None, raw: Any | None, observed_ms: int) -> None:
+        if event in {"binance_book", "binance_depth", "hl_book", "hl_ctx", "hl_trade"}:
+            return
+        reason = reason or ""
+        if event in {"quote_skip", "quote_cancel_skip", "cancel_all_skip", "flatten_skip"}:
+            key = f"{event}:{reason}:{_raw_quote_side(raw)}"
+            last_ms = self._last_console_skip_by_key.get(key, 0)
+            if observed_ms - last_ms < 10_000:
+                return
+            self._last_console_skip_by_key[key] = observed_ms
+        if event == "quote_place":
+            print(f"[{utc_iso(observed_ms)}] quote placed {reason or ''} {_raw_order_summary(raw)}", flush=True)
+        elif event == "quote_cancel":
+            print(f"[{utc_iso(observed_ms)}] quote canceled reason={reason} {_raw_order_summary(raw)}", flush=True)
+        elif event == "quote_reject":
+            print(f"[{utc_iso(observed_ms)}] quote rejected reason={reason}", flush=True)
+        elif event == "quote_skip":
+            print(f"[{utc_iso(observed_ms)}] quote skipped reason={reason} side={_raw_quote_side(raw)}", flush=True)
+        elif event == "quote_cancel_skip":
+            print(f"[{utc_iso(observed_ms)}] quote cancel skipped reason={reason}", flush=True)
+        elif event == "cancel_all":
+            print(f"[{utc_iso(observed_ms)}] cancel-all sent reason={reason}", flush=True)
+        elif event == "cancel_all_skip":
+            print(f"[{utc_iso(observed_ms)}] cancel-all skipped reason={reason}", flush=True)
+        elif event == "flatten_submit":
+            print(f"[{utc_iso(observed_ms)}] FLATTEN submitted reason={reason} {_raw_flatten_summary(raw)}", flush=True)
+        elif event == "flatten_reject":
+            print(f"[{utc_iso(observed_ms)}] FLATTEN rejected reason={reason}", flush=True)
+        elif event == "flatten_error":
+            print(f"[{utc_iso(observed_ms)}] FLATTEN error reason={reason}", flush=True)
+        elif event == "flatten_skip":
+            print(f"[{utc_iso(observed_ms)}] flatten skipped reason={reason}", flush=True)
+        elif event == "unresolved_position_alert":
+            print(f"[{utc_iso(observed_ms)}] UNRESOLVED POSITION reason={reason} {_raw_flatten_summary(raw)}", flush=True)
+        elif event == "position_reconcile":
+            print(f"[{utc_iso(observed_ms)}] position reconcile reason={reason} {_raw_position_summary(raw)}", flush=True)
+        elif event == "position_reconcile_error":
+            print(f"[{utc_iso(observed_ms)}] position reconcile error reason={reason}", flush=True)
+        elif event == "position_mismatch_alert":
+            print(f"[{utc_iso(observed_ms)}] POSITION MISMATCH entries halted {_raw_position_summary(raw)}", flush=True)
+        elif event == "live_entry_halt":
+            print(f"[{utc_iso(observed_ms)}] LIVE ENTRIES HALTED reason={reason}", flush=True)
+        elif event == "open_orders_reconcile":
+            print(f"[{utc_iso(observed_ms)}] open orders reconcile reason={reason}", flush=True)
+        elif event == "order_update":
+            print(f"[{utc_iso(observed_ms)}] order update {_raw_order_summary(raw)}", flush=True)
+        elif event == "deadman_refresh":
+            print(f"[{utc_iso(observed_ms)}] deadman refresh {_raw_status(raw)}", flush=True)
+        elif event.endswith("_connected") or event.endswith("_disconnected") or event.endswith("_timeout"):
+            print(f"[{utc_iso(observed_ms)}] {event} {reason}".rstrip(), flush=True)
+        elif event in {"strategy_task_error", "strategy_task_stopped", "set_leverage"}:
+            print(f"[{utc_iso(observed_ms)}] {event} {reason}".rstrip(), flush=True)
+
+
+def _fmt_float(value: float | None, decimals: int) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{decimals}f}"
+
+
+def _fmt_ms(value: int | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value}ms"
+
+
+def _fmt_order(order: ActiveOrder | None) -> str:
+    if order is None:
+        return "-"
+    suffix = ":RO" if order.reduce_only else ""
+    return f"{_fmt_float(order.price, 4)}x{_fmt_float(order.remaining_size if order.remaining_size is not None else order.size, 4)}{suffix}"
+
+
+def _raw_quote_side(raw: Any | None) -> str:
+    if isinstance(raw, dict):
+        side = raw.get("quote_side")
+        if side is not None:
+            return str(side)
+    return "-"
+
+
+def _raw_status(raw: Any | None) -> str:
+    if isinstance(raw, dict):
+        status = raw.get("status")
+        response = raw.get("response")
+        if status is not None:
+            return f"status={status} response={response}"
+    return ""
+
+
+def _raw_flatten_summary(raw: Any | None) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    size = raw.get("size")
+    px = raw.get("limit_px")
+    position = raw.get("position_size")
+    is_buy = raw.get("is_buy")
+    pieces = []
+    if position is not None:
+        pieces.append(f"pos={position}")
+    if is_buy is not None:
+        pieces.append(f"side={'buy' if is_buy else 'sell'}")
+    if size is not None:
+        pieces.append(f"sz={size}")
+    if px is not None:
+        pieces.append(f"px={px}")
+    return " ".join(pieces)
+
+
+def _raw_position_summary(raw: Any | None) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    exchange_position = raw.get("exchange_position")
+    internal_inventory = raw.get("internal_inventory")
+    diff = raw.get("diff")
+    mismatch = raw.get("mismatch")
+    pieces = []
+    if exchange_position is not None:
+        pieces.append(f"exchange={exchange_position}")
+    if internal_inventory is not None:
+        pieces.append(f"internal={internal_inventory}")
+    if diff is not None:
+        pieces.append(f"diff={diff}")
+    if mismatch is not None:
+        pieces.append(f"mismatch={mismatch}")
+    return " ".join(pieces)
+
+
+def _raw_order_summary(raw: Any | None) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    status = raw.get("status")
+    response = raw.get("response")
+    if status is not None:
+        return f"status={status}" if response is None else f"status={status} response={response}"
+    side = raw.get("side") or raw.get("quote_side")
+    cloid = raw.get("cloid")
+    price = raw.get("price")
+    size = raw.get("size")
+    pieces = []
+    if side is not None:
+        pieces.append(f"side={side}")
+    if price is not None:
+        pieces.append(f"px={price}")
+    if size is not None:
+        pieces.append(f"sz={size}")
+    if cloid is not None:
+        pieces.append(f"cloid={cloid}")
+    return " ".join(pieces)

@@ -24,13 +24,14 @@ class MMConfig:
     max_order_size: float = 0.01
     max_open_notional: float = 50.0
     quote_half_spread_bps: float = 4.0
-    requote_threshold_bps: float = 1.5
+    requote_threshold_bps: float = 3.0
     force_requote_threshold_bps: float = 4.0
     max_quote_top_gap_bps: float = 2.0
-    min_quote_lifetime_ms: int = 1_000
+    min_quote_lifetime_ms: int = 5_000
     basis_ema_period: int = 50
-    max_data_age_ms: int = 1_500
-    max_cross_recv_skew_ms: int = 500
+    max_data_age_ms: int = 4_000
+    max_cross_recv_skew_ms: int = 2_500
+    feed_unhealthy_cancel_grace_ms: int = 5_000
     max_fair_deviation_bps: float = 30.0
     soft_inventory_limit: float = 0.02
     hard_inventory_limit: float = 0.04
@@ -39,8 +40,20 @@ class MMConfig:
     rapid_move_threshold_bps: float = 5.0
     recent_move_lookback_ms: int = 2_000
     market_snapshot_interval_ms: int = 500
+    console_status_interval_ms: int = 5_000
     strategy_loop_interval_ms: int = 100
-    deadman_ms: int = 15_000
+    live_order_action_min_interval_ms: int = 15_000
+    live_reject_cooldown_ms: int = 120_000
+    live_cancel_all_min_interval_ms: int = 15_000
+    live_cancel_all_when_no_active_orders: bool = False
+    halt_entries_on_request_limit: bool = True
+    exit_ioc_price_protection_bps: float = 10.0
+    flatten_cooldown_ms: int = 30_000
+    unresolved_position_alert_interval_ms: int = 5_000
+    position_reconcile_interval_ms: int = 30_000
+    position_reconcile_tolerance: float = 1e-9
+    halt_entries_on_position_mismatch: bool = True
+    deadman_ms: int = 0
     deadman_refresh_ms: int = 5_000
     recv_timeout_s: float = 75.0
     reconnect_delay_s: float = 3.0
@@ -103,6 +116,8 @@ def validate_config(config: MMConfig) -> None:
         raise ValueError("--max-data-age-ms must be positive")
     if config.max_cross_recv_skew_ms <= 0:
         raise ValueError("--max-cross-recv-skew-ms must be positive")
+    if config.feed_unhealthy_cancel_grace_ms < 0:
+        raise ValueError("--feed-unhealthy-cancel-grace-ms cannot be negative")
     if config.max_fair_deviation_bps <= 0:
         raise ValueError("--max-fair-deviation-bps must be positive")
     if config.soft_inventory_limit <= 0:
@@ -119,14 +134,33 @@ def validate_config(config: MMConfig) -> None:
         raise ValueError("--rapid-move-threshold-bps must be positive")
     if config.market_snapshot_interval_ms <= 0:
         raise ValueError("--market-snapshot-interval-ms must be positive")
+    if config.console_status_interval_ms < 0:
+        raise ValueError("--console-status-interval-ms cannot be negative")
     if config.strategy_loop_interval_ms <= 0:
         raise ValueError("--strategy-loop-interval-ms must be positive")
-    if config.deadman_ms <= 0:
-        raise ValueError("--deadman-ms must be positive")
-    if config.deadman_refresh_ms <= 0:
-        raise ValueError("--deadman-refresh-ms must be positive")
-    if config.deadman_refresh_ms >= config.deadman_ms:
-        raise ValueError("--deadman-refresh-ms must be smaller than --deadman-ms")
+    if config.live_order_action_min_interval_ms < 0:
+        raise ValueError("--live-order-action-min-interval-ms cannot be negative")
+    if config.live_reject_cooldown_ms < 0:
+        raise ValueError("--live-reject-cooldown-ms cannot be negative")
+    if config.live_cancel_all_min_interval_ms < 0:
+        raise ValueError("--live-cancel-all-min-interval-ms cannot be negative")
+    if config.exit_ioc_price_protection_bps < 0:
+        raise ValueError("--exit-ioc-price-protection-bps cannot be negative")
+    if config.flatten_cooldown_ms < 0:
+        raise ValueError("--flatten-cooldown-ms cannot be negative")
+    if config.unresolved_position_alert_interval_ms < 0:
+        raise ValueError("--unresolved-position-alert-interval-ms cannot be negative")
+    if config.position_reconcile_interval_ms < 0:
+        raise ValueError("--position-reconcile-interval-ms cannot be negative")
+    if config.position_reconcile_tolerance < 0:
+        raise ValueError("--position-reconcile-tolerance cannot be negative")
+    if config.deadman_ms < 0:
+        raise ValueError("--deadman-ms cannot be negative")
+    if config.deadman_ms > 0:
+        if config.deadman_refresh_ms <= 0:
+            raise ValueError("--deadman-refresh-ms must be positive when --deadman-ms is enabled")
+        if config.deadman_refresh_ms >= config.deadman_ms:
+            raise ValueError("--deadman-refresh-ms must be smaller than --deadman-ms")
     if config.recv_timeout_s <= 0:
         raise ValueError("--recv-timeout-s must be positive")
     if config.reconnect_delay_s <= 0:
@@ -158,13 +192,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-order-size", type=float, default=0.01)
     parser.add_argument("--max-open-notional", type=float, default=50.0)
     parser.add_argument("--quote-half-spread-bps", type=float, default=4.0)
-    parser.add_argument("--requote-threshold-bps", type=float, default=1.5)
+    parser.add_argument("--requote-threshold-bps", type=float, default=3.0)
     parser.add_argument("--force-requote-threshold-bps", type=float, default=4.0)
     parser.add_argument("--max-quote-top-gap-bps", type=float, default=2.0)
-    parser.add_argument("--min-quote-lifetime-ms", type=int, default=1_000)
+    parser.add_argument("--min-quote-lifetime-ms", type=int, default=5_000)
     parser.add_argument("--basis-ema-period", type=int, default=50)
-    parser.add_argument("--max-data-age-ms", type=int, default=1_500)
-    parser.add_argument("--max-cross-recv-skew-ms", type=int, default=500)
+    parser.add_argument("--max-data-age-ms", type=int, default=4_000)
+    parser.add_argument("--max-cross-recv-skew-ms", type=int, default=2_500)
+    parser.add_argument("--feed-unhealthy-cancel-grace-ms", type=int, default=5_000)
     parser.add_argument("--max-fair-deviation-bps", type=float, default=30.0)
     parser.add_argument("--soft-inventory-limit", type=float, default=0.02)
     parser.add_argument("--hard-inventory-limit", type=float, default=0.04)
@@ -173,8 +208,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rapid-move-threshold-bps", type=float, default=5.0)
     parser.add_argument("--recent-move-lookback-ms", type=int, default=2_000)
     parser.add_argument("--market-snapshot-interval-ms", type=int, default=500)
+    parser.add_argument("--console-status-interval-ms", type=int, default=5_000, help="Print a compact status line at this interval; 0 disables heartbeat")
     parser.add_argument("--strategy-loop-interval-ms", type=int, default=100)
-    parser.add_argument("--deadman-ms", type=int, default=15_000)
+    parser.add_argument("--live-order-action-min-interval-ms", type=int, default=15_000)
+    parser.add_argument("--live-reject-cooldown-ms", type=int, default=120_000)
+    parser.add_argument("--live-cancel-all-min-interval-ms", type=int, default=15_000)
+    parser.add_argument("--allow-live-cancel-all-without-active-orders", dest="live_cancel_all_when_no_active_orders", action="store_true")
+    parser.add_argument("--no-halt-entries-on-request-limit", dest="halt_entries_on_request_limit", action="store_false")
+    parser.add_argument("--exit-ioc-price-protection-bps", type=float, default=10.0)
+    parser.add_argument("--flatten-cooldown-ms", type=int, default=30_000)
+    parser.add_argument("--unresolved-position-alert-interval-ms", type=int, default=5_000)
+    parser.add_argument("--position-reconcile-interval-ms", type=int, default=30_000)
+    parser.add_argument("--position-reconcile-tolerance", type=float, default=1e-9)
+    parser.add_argument("--no-halt-entries-on-position-mismatch", dest="halt_entries_on_position_mismatch", action="store_false")
+    parser.add_argument("--deadman-ms", type=int, default=0, help="Hyperliquid scheduled-cancel horizon; 0 disables it")
     parser.add_argument("--deadman-refresh-ms", type=int, default=5_000)
     parser.add_argument("--recv-timeout-s", type=float, default=75.0)
     parser.add_argument("--reconnect-delay-s", type=float, default=3.0)
@@ -186,7 +233,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--binance-depth-stream", default="depth5@100ms")
     parser.add_argument("--hl-ws-url", default=DEFAULT_HL_WS_URL)
     parser.add_argument("--binance-ws-base", default=DEFAULT_BINANCE_WS_BASE)
-    parser.set_defaults(set_leverage_on_start=True)
+    parser.set_defaults(
+        set_leverage_on_start=True,
+        live_cancel_all_when_no_active_orders=False,
+        halt_entries_on_request_limit=True,
+        halt_entries_on_position_mismatch=True,
+    )
     return parser
 
 
@@ -211,6 +263,7 @@ def config_from_args(args: argparse.Namespace) -> MMConfig:
         basis_ema_period=args.basis_ema_period,
         max_data_age_ms=args.max_data_age_ms,
         max_cross_recv_skew_ms=args.max_cross_recv_skew_ms,
+        feed_unhealthy_cancel_grace_ms=args.feed_unhealthy_cancel_grace_ms,
         max_fair_deviation_bps=args.max_fair_deviation_bps,
         soft_inventory_limit=args.soft_inventory_limit,
         hard_inventory_limit=args.hard_inventory_limit,
@@ -219,7 +272,19 @@ def config_from_args(args: argparse.Namespace) -> MMConfig:
         rapid_move_threshold_bps=args.rapid_move_threshold_bps,
         recent_move_lookback_ms=args.recent_move_lookback_ms,
         market_snapshot_interval_ms=args.market_snapshot_interval_ms,
+        console_status_interval_ms=args.console_status_interval_ms,
         strategy_loop_interval_ms=args.strategy_loop_interval_ms,
+        live_order_action_min_interval_ms=args.live_order_action_min_interval_ms,
+        live_reject_cooldown_ms=args.live_reject_cooldown_ms,
+        live_cancel_all_min_interval_ms=args.live_cancel_all_min_interval_ms,
+        live_cancel_all_when_no_active_orders=args.live_cancel_all_when_no_active_orders,
+        halt_entries_on_request_limit=args.halt_entries_on_request_limit,
+        exit_ioc_price_protection_bps=args.exit_ioc_price_protection_bps,
+        flatten_cooldown_ms=args.flatten_cooldown_ms,
+        unresolved_position_alert_interval_ms=args.unresolved_position_alert_interval_ms,
+        position_reconcile_interval_ms=args.position_reconcile_interval_ms,
+        position_reconcile_tolerance=args.position_reconcile_tolerance,
+        halt_entries_on_position_mismatch=args.halt_entries_on_position_mismatch,
         deadman_ms=args.deadman_ms,
         deadman_refresh_ms=args.deadman_refresh_ms,
         recv_timeout_s=args.recv_timeout_s,
@@ -235,4 +300,3 @@ def config_from_args(args: argparse.Namespace) -> MMConfig:
     )
     validate_config(config)
     return config
-

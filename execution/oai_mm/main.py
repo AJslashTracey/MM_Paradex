@@ -13,6 +13,7 @@ from .inventory_manager import InventoryManager
 from .logger import MMLogger
 from .models import BotState, VenueState
 from .order_manager import OrderManager
+from .position_reconciler import PositionReconciler
 from .quote_engine import QuoteEngine
 from .risk_manager import RiskManager
 from .utils import decimal_places_for_float, load_size_decimals, now_ms, utc_iso
@@ -25,7 +26,15 @@ async def run_bot() -> int:
     binance_state = VenueState(venue="binance", symbol=config.binance_symbol)
     state = BotState(hl=hl_state, binance=binance_state)
     inventory = InventoryManager()
-    executor = HyperliquidExecutor(testnet=config.testnet) if config.live else None
+    executor = (
+        HyperliquidExecutor(
+            testnet=config.testnet,
+            target_coin=config.target_coin,
+            timeout_s=config.http_timeout,
+        )
+        if config.live
+        else None
+    )
     size_decimals = (
         load_size_decimals(config.target_coin, config.http_timeout)
         if config.live
@@ -34,17 +43,17 @@ async def run_bot() -> int:
     trigger = asyncio.Event()
     user_event_queue: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
 
-    if config.live and executor is not None:
-        existing_orders = executor.get_open_orders(config.target_coin)
-        existing_position = executor.get_position(config.target_coin)
-        if existing_orders:
-            raise RuntimeError(f"existing open orders found for {config.target_coin}; aborting live market-maker start")
-        if existing_position is not None and abs(existing_position.size) > 0:
-            raise RuntimeError(f"existing position found for {config.target_coin}: {existing_position.size}; aborting")
-
     order_manager = OrderManager(config, None, inventory, executor, size_decimals)
     logger = MMLogger(config, state, inventory, order_manager)
     order_manager.logger = logger
+    position_reconciler = PositionReconciler(config, state, inventory, executor, logger)
+
+    if config.live and executor is not None:
+        startup_ms = now_ms()
+        existing_orders = executor.get_open_orders(config.target_coin)
+        order_manager.ingest_open_orders(existing_orders, startup_ms, reason="startup")
+        existing_position = executor.get_position(config.target_coin)
+        position_reconciler.seed_exchange_position(existing_position, startup_ms, reason="startup")
 
     if config.live and executor is not None and config.set_leverage_on_start:
         raw = executor.set_leverage(coin=config.target_coin, leverage=config.leverage, cross=False)
@@ -102,8 +111,11 @@ async def run_bot() -> int:
                 event_name, payload = await user_event_queue.get()
                 if event_name == "hl_user_fills":
                     order_manager.handle_fill(payload, state.fair_value, observed_ms)
+                    position_reconciler.update_internal()
                 elif event_name == "hl_order_updates":
-                    logger.log_event("order_update", raw=payload)
+                    order_manager.handle_order_update(payload, observed_ms)
+
+            position_reconciler.maybe_reconcile(observed_ms)
 
             if state.fair_value is not None and state.fair_value.fair_px is not None:
                 state.quote_plan = quote_engine.build_plan(hl_state, state.fair_value.fair_px, inventory, observed_ms)
@@ -127,10 +139,29 @@ async def run_bot() -> int:
                 observed_ms,
             )
 
-            if state.risk.should_cancel_all:
+            position_to_flatten = position_reconciler.position_to_flatten()
+            position_halt_reason = position_reconciler.entry_halt_reason()
+            live_entry_halt_reason = (
+                None
+                if order_manager.live_entries_halted_reason is None
+                else f"live_entry_halt:{order_manager.live_entries_halted_reason}"
+            )
+            entry_halt_reason = position_halt_reason or live_entry_halt_reason
+
+            if abs(position_to_flatten) > config.position_reconcile_tolerance:
+                order_manager.cancel_non_reducing_orders("position_exit_priority", observed_ms)
+                order_manager.flatten_position_if_needed(
+                    position_to_flatten,
+                    hl_state,
+                    observed_ms,
+                    position_halt_reason or "position_open",
+                )
+            elif entry_halt_reason is not None:
+                order_manager.cancel_non_reducing_orders(entry_halt_reason, observed_ms)
+            elif state.risk.should_cancel_all:
                 order_manager.cancel_all(state.risk.reason or "risk_cancel", emergency=True)
             elif not state.risk.quoting_allowed or state.quote_plan is None:
-                order_manager.cancel_all(state.risk.reason or "quote_pause")
+                pass
             else:
                 force = False
                 if (
