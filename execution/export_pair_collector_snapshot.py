@@ -8,9 +8,10 @@ import math
 import re
 import shutil
 import statistics
+import subprocess
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,18 @@ def parse_args() -> argparse.Namespace:
         "--export-name",
         default=None,
         help="Optional export folder name; defaults to a dated snapshot name",
+    )
+    parser.add_argument(
+        "--compression",
+        choices=("none", "zstd"),
+        default="none",
+        help="Compress exported CSV files; default: none",
+    )
+    parser.add_argument(
+        "--last-hours",
+        type=float,
+        default=None,
+        help="Export only the trailing number of hours ending at each pair's latest market row",
     )
     return parser.parse_args()
 
@@ -105,6 +118,20 @@ def display_path(path: Path, cwd: Path) -> str:
         return str(path.resolve().relative_to(cwd.resolve()))
     except ValueError:
         return str(path.resolve())
+
+
+def parse_utc_datetime(value: str, path: Path) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"invalid time_utc value in {path}: {value!r}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"time_utc value is missing a timezone in {path}: {value!r}")
+    return parsed
+
+
+def format_utc_datetime(value: datetime) -> str:
+    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def load_pair_paths(path_str: str) -> PairPaths:
@@ -265,10 +292,45 @@ def copy_file(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
 
 
+def copy_csv_window(source: Path, destination: Path, start_time: datetime, end_time: datetime) -> None:
+    with source.open(newline="") as source_handle, destination.open("w", newline="") as destination_handle:
+        reader = csv.DictReader(source_handle)
+        if reader.fieldnames is None or "time_utc" not in reader.fieldnames:
+            raise ValueError(f"CSV is missing a time_utc column: {source}")
+        writer = csv.DictWriter(destination_handle, fieldnames=reader.fieldnames)
+        writer.writeheader()
+        for row in reader:
+            time_text = (row.get("time_utc") or "").strip()
+            if not time_text:
+                continue
+            row_time = parse_utc_datetime(time_text, source)
+            if start_time <= row_time <= end_time:
+                writer.writerow(row)
+
+
+def compress_csv(path: Path, compression: str) -> Path:
+    if compression == "none":
+        return path
+    if compression != "zstd":
+        raise ValueError(f"unsupported compression: {compression}")
+    if shutil.which("zstd") is None:
+        raise RuntimeError("zstd compression requested, but the zstd executable is not installed")
+
+    compressed_destination = path.with_name(f"{path.name}.zst")
+    subprocess.run(
+        ["zstd", "-q", "-3", "-f", str(path), "-o", str(compressed_destination)],
+        check=True,
+    )
+    path.unlink()
+    return compressed_destination
+
+
 def build_readme(
     export_name: str,
     pair_exports: list[dict[str, Any]],
     cwd: Path,
+    compression: str,
+    last_hours: float | None,
 ) -> str:
     pair_ids = [item["pair_id"] for item in pair_exports]
     lines: list[str] = []
@@ -287,6 +349,12 @@ def build_readme(
     for pair_id in pair_ids:
         lines.append(f"- `{pair_id}`")
     lines.append("")
+    if last_hours is not None:
+        lines.append(f"Window: trailing `{last_hours:g}` hours ending at each pair's latest market row.")
+        lines.append("")
+    if compression != "none":
+        lines.append(f"CSV compression: `{compression}`.")
+        lines.append("")
     lines.append("Source files at snapshot time:")
     lines.append("")
     for item in pair_exports:
@@ -342,39 +410,82 @@ def build_readme(
     return "\n".join(lines) + "\n"
 
 
-def export_snapshot(pair_dirs: list[str], export_root: Path, export_name: str | None = None) -> Path:
+def export_snapshot(
+    pair_dirs: list[str],
+    export_root: Path,
+    export_name: str | None = None,
+    compression: str = "none",
+    last_hours: float | None = None,
+) -> Path:
+    if last_hours is not None and last_hours <= 0:
+        raise ValueError("last_hours must be positive")
+    if compression not in {"none", "zstd"}:
+        raise ValueError(f"unsupported compression: {compression}")
+
     cwd = Path.cwd()
     pair_paths = [load_pair_paths(path_str) for path_str in pair_dirs]
     pair_ids: list[str] = []
+    source_summaries: list[dict[str, Any]] = []
     for paths in pair_paths:
         summarized = summarize_market_data(paths.market_data)
         pair_ids.append(summarized["pair_id"])
+        source_summaries.append(summarized)
 
     resolved_export_name = export_name or default_export_name(pair_ids)
     export_dir = (export_root if export_root.is_absolute() else cwd / export_root) / resolved_export_name
     export_dir.mkdir(parents=True, exist_ok=False)
 
     pair_exports: list[dict[str, Any]] = []
-    for paths in pair_paths:
+    for paths, source_summary in zip(pair_paths, source_summaries):
         market_file = f"{paths.base_name}_market_data.csv"
         events_file = f"{paths.base_name}_collector_events.csv" if paths.collector_events is not None else None
         fills_file = f"{paths.base_name}_collector_fills.csv" if paths.collector_fills is not None else None
 
+        end_time = None
+        start_time = None
+        if last_hours is not None:
+            last_time_utc = source_summary["summary"]["last_time_utc"]
+            if last_time_utc is None:
+                raise ValueError(f"market data is missing time_utc values: {paths.market_data}")
+            end_time = parse_utc_datetime(last_time_utc, paths.market_data)
+            start_time = end_time - timedelta(hours=last_hours)
+
         copied_market = export_dir / market_file
-        copy_file(paths.market_data, copied_market)
+        if start_time is None or end_time is None:
+            copy_file(paths.market_data, copied_market)
+        else:
+            copy_csv_window(paths.market_data, copied_market, start_time, end_time)
         copied_events = None
         copied_fills = None
         if paths.collector_events is not None and events_file is not None:
             copied_events = export_dir / events_file
-            copy_file(paths.collector_events, copied_events)
+            if start_time is None or end_time is None:
+                copy_file(paths.collector_events, copied_events)
+            else:
+                copy_csv_window(paths.collector_events, copied_events, start_time, end_time)
         if paths.collector_fills is not None and fills_file is not None:
             copied_fills = export_dir / fills_file
-            copy_file(paths.collector_fills, copied_fills)
+            if start_time is None or end_time is None:
+                copy_file(paths.collector_fills, copied_fills)
+            else:
+                copy_csv_window(paths.collector_fills, copied_fills, start_time, end_time)
 
         summarized = summarize_market_data(copied_market)
         pair_summary = summarized["summary"]
         pair_summary["collector_event_rows"] = count_csv_rows(copied_events)
         pair_summary["collector_fill_rows"] = count_csv_rows(copied_fills)
+        if start_time is not None and end_time is not None:
+            pair_summary["window_start_utc"] = format_utc_datetime(start_time)
+            pair_summary["window_end_utc"] = format_utc_datetime(end_time)
+
+        copied_market = compress_csv(copied_market, compression)
+        if copied_events is not None:
+            copied_events = compress_csv(copied_events, compression)
+        if copied_fills is not None:
+            copied_fills = compress_csv(copied_fills, compression)
+        market_file = copied_market.name
+        events_file = copied_events.name if copied_events is not None else None
+        fills_file = copied_fills.name if copied_fills is not None else None
 
         pair_export: dict[str, Any] = {
             "pair_id": summarized["pair_id"],
@@ -392,6 +503,8 @@ def export_snapshot(pair_dirs: list[str], export_root: Path, export_name: str | 
     summary_json: dict[str, Any] = {
         "export_name": resolved_export_name,
         "generated_utc": generated_utc,
+        "compression": compression,
+        "last_hours": last_hours,
         "pairs": {},
     }
     for item in pair_exports:
@@ -409,7 +522,7 @@ def export_snapshot(pair_dirs: list[str], export_root: Path, export_name: str | 
         ordered_summary.update(pair_summary)
         summary_json["pairs"][item["pair_id"]] = ordered_summary
 
-    readme_text = build_readme(resolved_export_name, pair_exports, cwd)
+    readme_text = build_readme(resolved_export_name, pair_exports, cwd, compression, last_hours)
     (export_dir / "README.md").write_text(readme_text)
     (export_dir / "summary.json").write_text(json.dumps(summary_json, indent=2) + "\n")
     return export_dir
@@ -417,7 +530,13 @@ def export_snapshot(pair_dirs: list[str], export_root: Path, export_name: str | 
 
 def main() -> int:
     args = parse_args()
-    export_dir = export_snapshot(args.pair_dir, args.export_root, args.export_name)
+    export_dir = export_snapshot(
+        args.pair_dir,
+        args.export_root,
+        args.export_name,
+        compression=args.compression,
+        last_hours=args.last_hours,
+    )
     print(export_dir)
     return 0
 
